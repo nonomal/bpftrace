@@ -67,8 +67,12 @@ std::string to_string(MapType t)
       return "mapped_printf_data";
     case MapType::Ringbuf:
       return "ringbuf";
-    case MapType::RingbufLossCounter:
-      return "ringbuf_loss_counter";
+    case MapType::StrBuffer:
+      return "str_buffer";
+    case MapType::EventLossCounter:
+      return "event_loss_counter";
+    case MapType::RecursionPrevention:
+      return "recursion_prevention";
   }
   return {}; // unreached
 }

@@ -11,6 +11,7 @@
 #include <llvm/IR/Module.h>
 #include <llvm/Support/raw_os_ostream.h>
 
+#include "ast/async_ids.h"
 #include "ast/dibuilderbpf.h"
 #include "ast/irbuilderbpf.h"
 #include "ast/visitors.h"
@@ -28,7 +29,11 @@ using CallArgs = std::vector<std::tuple<FormatString, std::vector<Field>>>;
 
 class CodegenLLVM : public Visitor {
 public:
-  explicit CodegenLLVM(Node *root, BPFtrace &bpftrace);
+  explicit CodegenLLVM(Node *root, BPFtrace &bpftrace, bool is_aot = false);
+  explicit CodegenLLVM(Node *root,
+                       BPFtrace &bpftrace,
+                       bool is_aot,
+                       std::unique_ptr<USDTHelper> usdt_helper);
 
   void visit(Integer &integer) override;
   void visit(PositionalParameter &param) override;
@@ -72,13 +77,13 @@ public:
   void DumpIR(std::ostream &out);
   void DumpIR(const std::string filename);
   void createFormatStringCall(Call &call,
-                              int &id,
+                              int id,
                               CallArgs &call_args,
                               const std::string &call_name,
                               AsyncAction async_action);
 
   void createPrintMapCall(Call &call);
-  void createPrintNonMapCall(Call &call, int &id);
+  void createPrintNonMapCall(Call &call, int id);
 
   void createMapDefinition(const std::string &name,
                            libbpf::bpf_map_type map_type,
@@ -91,6 +96,8 @@ public:
       const std::string &name);
 
   void generate_ir(void);
+  libbpf::bpf_map_type get_map_type(const SizedType &val_type,
+                                    const MapKey &key);
   void generate_maps(const RequiredResources &resources);
   void optimize(void);
   bool verify(void);
@@ -152,6 +159,12 @@ private:
                      std::optional<int> usdt_location_index = std::nullopt,
                      bool dummy = false);
 
+  // Generate a probe and register it to the BPFtrace class.
+  void add_probe(AttachPoint &ap,
+                 Probe &probe,
+                 const std::string &name,
+                 FunctionType *func_type);
+
   [[nodiscard]] ScopedExprDeleter accept(Node *node);
   [[nodiscard]] std::tuple<Value *, ScopedExprDeleter> getMapKey(Map &map);
   AllocaInst *getMultiMapKey(Map &map, const std::vector<Value *> &extra_keys);
@@ -183,6 +196,7 @@ private:
   //
   // If null, return value will depend on current attach point (void in subprog)
   void createRet(Value *value = nullptr);
+  int getReturnValueForProbe(ProbeType probe_type);
 
   // Every time we see a watchpoint that specifies a function + arg pair, we
   // generate a special "setup" probe that:
@@ -220,25 +234,25 @@ private:
   void createIncDec(Unop &unop);
 
   Function *createMapLenCallback();
-  Function *createForEachMapCallback(const Variable &decl,
+  Function *createForEachMapCallback(Map &map,
+                                     const Variable &decl,
                                      const std::vector<Statement *> &stmts);
   Function *createMurmurHash2Func();
 
-  // Return a lambda that has captured-by-value CodegenLLVM's async id state
-  // (ie `printf_id_`, `mapped_printf_id_`, etc.).  Running the returned lambda
-  // will restore `CodegenLLVM`s async id state back to when this function was
-  // first called.
-  std::function<void()> create_reset_ids();
+  bool canAggPerCpuMapElems(const SizedType &val_type, const MapKey &key);
 
   Node *root_ = nullptr;
 
   BPFtrace &bpftrace_;
+  std::unique_ptr<USDTHelper> usdt_helper_;
   std::unique_ptr<LLVMContext> context_;
   std::unique_ptr<TargetMachine> target_machine_;
   std::unique_ptr<Module> module_;
+  AsyncIds async_ids_;
   IRBuilderBPF b_;
 
   DIBuilderBPF debug_;
+  bool is_aot_;
 
   const DataLayout &datalayout() const
   {
@@ -260,18 +274,6 @@ private:
   bool inside_subprog_ = false;
 
   std::map<std::string, AllocaInst *> variables_;
-  int printf_id_ = 0;
-  int mapped_printf_id_ = 0;
-  int time_id_ = 0;
-  int cat_id_ = 0;
-  int strftime_id_ = 0;
-  uint64_t join_id_ = 0;
-  int system_id_ = 0;
-  int non_map_print_id_ = 0;
-  uint64_t watchpoint_id_ = 0;
-  int cgroup_path_id_ = 0;
-  int skb_output_id_ = 0;
-
   std::unordered_map<std::string, libbpf::bpf_map_type> map_types_;
 
   Function *linear_func_ = nullptr;

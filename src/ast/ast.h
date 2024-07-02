@@ -62,6 +62,17 @@ enum class Operator {
   BNOT,
 };
 
+// There are 2 kinds of attach point expansion:
+// - full expansion  - separate LLVM function is generated for each match
+// - multi expansion - one LLVM function and BPF program is generated for all
+//                     matches, the list of expanded functions is attached to
+//                     the BPF program using the k(u)probe.multi mechanism
+enum class ExpansionType {
+  NONE,
+  FULL,
+  MULTI,
+};
+
 class Node {
 public:
   Node() = default;
@@ -187,6 +198,13 @@ public:
 
   std::string ident;
   int probe_id;
+
+  // Check if the builtin is 'arg0' - 'arg9'
+  bool is_argx() const
+  {
+    return !ident.compare(0, 3, "arg") && ident.size() == 4 &&
+           ident.at(3) >= '0' && ident.at(3) <= '9';
+  }
 
 private:
   Builtin(const Builtin &other) = default;
@@ -627,7 +645,9 @@ public:
   uint64_t len = 0;   // for watchpoint probes, the width of watched addr
   std::string mode;   // for watchpoint probes, the watch mode
   bool async = false; // for watchpoint probes, if it's an async watchpoint
-  bool need_expansion = false;
+
+  ExpansionType expansion = ExpansionType::NONE;
+
   uint64_t address = 0;
   uint64_t func_offset = 0;
   bool ignore_invalid = false;

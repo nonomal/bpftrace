@@ -7,6 +7,7 @@
 #include <iostream>
 #include <map>
 #include <optional>
+#include <set>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -157,6 +158,13 @@ static std::vector<std::string> COMPILE_TIME_FUNCS = { "cgroupid" };
 
 static std::vector<std::string> UPROBE_LANGS = { "cpp" };
 
+static const std::set<std::string> RECURSIVE_KERNEL_FUNCS = {
+  "vmlinux:_raw_spin_lock",
+  "vmlinux:_raw_spin_lock_irqsave",
+  "vmlinux:_raw_spin_unlock_irqrestore",
+  "vmlinux:queued_spin_lock_slowpath",
+};
+
 void get_uint64_env_var(const ::std::string &str,
                         const std::function<void(uint64_t)> &cb);
 void get_bool_env_var(const ::std::string &str,
@@ -185,8 +193,9 @@ std::vector<int> get_online_cpus();
 std::vector<int> get_possible_cpus();
 bool is_dir(const std::string &path);
 bool file_exists_and_ownedby_root(const char *f);
-std::tuple<std::string, std::string> get_kernel_dirs(
-    const struct utsname &utsname);
+bool get_kernel_dirs(const struct utsname &utsname,
+                     std::string &ksrc,
+                     std::string &kobj);
 std::vector<std::string> get_kernel_cflags(const char *uname_machine,
                                            const std::string &ksrc,
                                            const std::string &kobj,
@@ -200,11 +209,13 @@ std::vector<std::pair<std::string, std::string>> get_cgroup_paths(
 bool is_module_loaded(const std::string &module);
 FuncsModulesMap parse_traceable_funcs();
 const std::string &is_deprecated(const std::string &str);
+bool is_recursive_func(const std::string &func_name);
 bool is_unsafe_func(const std::string &func_name);
 bool is_compile_time_func(const std::string &func_name);
 bool is_supported_lang(const std::string &lang);
 bool is_type_name(std::string_view str);
 std::string exec_system(const char *cmd);
+bool is_exe(const std::string &path);
 std::vector<std::string> resolve_binary_path(const std::string &cmd);
 std::vector<std::string> resolve_binary_path(const std::string &cmd, int pid);
 std::string path_for_pid_mountns(int pid, const std::string &path);

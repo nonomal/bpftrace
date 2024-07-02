@@ -118,10 +118,17 @@ TIMEOUT 5
 AFTER ./testprogs/syscall read
 
 NAME kprobe_wildcard
+PROG kprobe:vmlinux:vfs_rea* { printf("SUCCESS %d\n", pid); exit(); }
+EXPECT_REGEX SUCCESS [0-9][0-9]*
+TIMEOUT 5
+AFTER ./testprogs/syscall read
+
+NAME kprobe_wildcard_multi
 RUN {{BPFTRACE}} --unsafe -e 'kprobe:ksys_* { printf("progs: "); system("/usr/sbin/bpftool prog | grep kprobe | grep ksys_ | wc -l"); exit(); }'
 EXPECT progs: 1
 TIMEOUT 5
 REQUIRES /usr/sbin/bpftool
+REQUIRES_FEATURE kprobe_multi
 
 NAME kprobe_module
 PROG kprobe:vmlinux:vfs_read { printf("SUCCESS %d\n", pid); exit(); }
@@ -140,6 +147,24 @@ PROG kprobe:nonsense:vfs_read { printf("SUCCESS %d\n", pid); exit(); }
 EXPECT ERROR: Error attaching probe: kprobe:nonsense:vfs_read: specified module nonsense in probe kprobe:nonsense:vfs_read is not loaded.
 TIMEOUT 5
 WILL_FAIL
+
+NAME kprobe_wildcard_all_leading_underscore
+PROG kprobe:_* { } interval:s:1{ printf("SUCCESS"); exit(); }
+EXPECT_REGEX SUCCESS
+ENV BPFTRACE_MAX_PROBES=20000
+TIMEOUT 5
+REQUIRES_FEATURE kprobe_multi
+
+NAME kprobe_disallow_rcu_functions
+PROG kprobe:rcu_* { printf("SUCCESS %d\n", pid); exit(); }
+EXPECT No probes to attach
+TIMEOUT 5
+WILL_FAIL
+
+NAME kprobe_hide_ftrace_invalid_address
+RUN {{BPFTRACE}} -l | grep -c __ftrace_invalid_address__ || true
+EXPECT 0
+TIMEOUT 5
 
 NAME kprobe_func_missing
 PROG kprobe:vmlinux:nonsense { printf("SUCCESS %d\n", pid); exit(); }
@@ -216,6 +241,22 @@ TIMEOUT 5
 REQUIRES lsmod | grep '^nf_tables'
 WILL_FAIL
 
+NAME kprobe_warn_missing_probes
+PROG kprobe:vfs_read,kprobe:nonsense { exit(); }
+EXPECT WARNING: could not attach probe kprobe:nonsense, skipping.
+TIMEOUT 5
+
+NAME kprobe_ignore_missing_probes
+PROG config = { missing_probes = "ignore" } kprobe:vfs_read,kprobe:nonsense { exit(); }
+EXPECT_NONE WARNING: could not attach probe kprobe:nonsense, skipping.
+TIMEOUT 5
+
+NAME kprobe_error_missing_probes
+PROG config = { missing_probes = "error" } kprobe:vfs_read,kprobe:nonsense { exit(); }
+EXPECT ERROR: Error attaching probe: kprobe:nonsense
+TIMEOUT 5
+WILL_FAIL
+
 NAME kretprobe
 PROG kretprobe:vfs_read { printf("SUCCESS %d\n", pid); exit(); }
 EXPECT_REGEX SUCCESS [0-9][0-9]*
@@ -235,12 +276,19 @@ TIMEOUT 5
 AFTER /bin/bash -c "./testprogs/syscall nanosleep 1000"; /bin/bash -c "./testprogs/syscall nanosleep 1000"
 
 NAME kretprobe_wildcard
+PROG kretprobe:vmlinux:vfs_rea* { printf("SUCCESS %d\n", pid); exit(); }
+EXPECT_REGEX SUCCESS [0-9][0-9]*
+TIMEOUT 5
+AFTER ./testprogs/syscall read
+
+NAME kretprobe_wildcard_multi
 RUN {{BPFTRACE}} --unsafe -e 'kretprobe:ksys_* { system("/usr/sbin/bpftool prog | grep kprobe | grep ksys_ | wc -l"); exit(); }'
 EXPECT 1
 TIMEOUT 5
 REQUIRES /usr/sbin/bpftool
+REQUIRES_FEATURE kprobe_multi
 
-NAME kretprobe_multi_wildcard
+NAME kretprobe_wildcard_multi_link
 RUN {{BPFTRACE}} --unsafe -e 'kretprobe:ksys_* { printf("link: "); system("/usr/sbin/bpftool link | grep kprobe_multi | wc -l"); exit(); }'
 EXPECT link: 1
 TIMEOUT 5
@@ -317,6 +365,25 @@ RUN {{BPFTRACE}} --unsafe -e 'uprobe:./testprogs/uprobe_test:_init { printf("arg
 EXPECT_REGEX arg0: [0-9]*
 TIMEOUT 5
 AFTER ./testprogs/uprobe_test
+
+NAME uprobe_warn_missing_probes
+PROG uprobe:./testprogs/uprobe_test:uprobeFunction1,uprobe:./testprogs/uprobe_test:uprobeFunction3 { exit(); }
+EXPECT WARNING: Could not resolve symbol: ./testprogs/uprobe_test:uprobeFunction3, skipping probe.
+TIMEOUT 5
+AFTER ./testprogs/uprobe_test
+
+NAME uprobe_ignore_missing_probes
+PROG config = { missing_probes = "ignore" } uprobe:./testprogs/uprobe_test:uprobeFunction1,uprobe:./testprogs/uprobe_test:uprobeFunction3 { exit(); }
+EXPECT_NONE WARNING: Could not resolve symbol: ./testprogs/uprobe_test:uprobeFunction3, skipping probe.
+TIMEOUT 5
+AFTER ./testprogs/uprobe_test
+
+NAME uprobe_error_missing_probes
+PROG config = { missing_probes = "error" } uprobe:./testprogs/uprobe_test:uprobeFunction1,uprobe:./testprogs/uprobe_test:uprobeFunction3 { exit(); }
+EXPECT ERROR: Could not resolve symbol: ./testprogs/uprobe_test:uprobeFunction3, cannot attach probe.
+TIMEOUT 5
+AFTER ./testprogs/uprobe_test
+WILL_FAIL
 
 NAME uretprobe
 PROG uretprobe:/bin/bash:echo_builtin { printf("readline: %d\n", retval); exit();}

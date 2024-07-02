@@ -47,33 +47,15 @@ struct stack_key {
   uint32_t nr_stack_frames;
 };
 
-enum class DebugLevel;
+enum class DebugStage;
 
 // globals
-extern DebugLevel bt_debug;
+extern std::set<DebugStage> bt_debug;
 extern bool bt_quiet;
 extern bool bt_verbose;
+extern bool dry_run;
 
-enum class DebugLevel { kNone, kDebug, kFullDebug };
-
-inline DebugLevel operator++(DebugLevel &level, int)
-{
-  switch (level) {
-    case DebugLevel::kNone:
-      level = DebugLevel::kDebug;
-      break;
-    case DebugLevel::kDebug:
-      level = DebugLevel::kFullDebug;
-      break;
-    case DebugLevel::kFullDebug:
-      // NOTE (mmarchini): should be handled by the caller
-      level = DebugLevel::kNone;
-      break;
-    default:
-      break;
-  }
-  return level;
-}
+enum class DebugStage { Ast, Codegen, CodegenOpt, Libbpf, Verifier };
 
 class WildcardException : public std::exception {
 public:
@@ -103,7 +85,9 @@ public:
   {
   }
   virtual ~BPFtrace();
-  virtual int add_probe(ast::Probe &p);
+  virtual int add_probe(const ast::AttachPoint &ap,
+                        const ast::Probe &p,
+                        int usdt_location_idx = 0);
   Probe generateWatchpointSetupProbe(const ast::AttachPoint &ap,
                                      const ast::Probe &probe);
   int num_probes() const;
@@ -156,6 +140,7 @@ public:
   std::optional<int64_t> get_int_literal(const ast::Expression *expr) const;
   std::optional<std::string> get_watchpoint_binary_path() const;
   virtual bool is_traceable_func(const std::string &func_name) const;
+  virtual int get_num_possible_cpus() const;
   virtual std::unordered_set<std::string> get_func_modules(
       const std::string &func_name) const;
   int create_pcaps(void);
@@ -166,6 +151,7 @@ public:
   bool has_btf_data() const;
   Dwarf *get_dwarf(const std::string &filename);
   Dwarf *get_dwarf(const ast::AttachPoint &attachpoint);
+  void kfunc_recursion_check(ast::Program *prog);
 
   std::string cmd_;
   bool finalize_ = false;
@@ -199,8 +185,9 @@ public:
   bool debug_output_ = false;
   std::optional<struct timespec> boottime_;
   std::optional<struct timespec> delta_taitime_;
-  static constexpr uint32_t rb_loss_cnt_key_ = 0;
-  static constexpr uint64_t rb_loss_cnt_val_ = 0;
+  static constexpr uint32_t event_loss_cnt_key_ = 0;
+  static constexpr uint64_t event_loss_cnt_val_ = 0;
+  bool need_recursion_check_ = false;
 
   static void sort_by_key(
       std::vector<SizedType> key_args,
@@ -223,7 +210,7 @@ public:
 
 private:
   int run_special_probe(std::string name,
-                        const BpfBytecode &bytecode,
+                        BpfBytecode &bytecode,
                         void (*trigger)(void));
   void *ksyms_{ nullptr };
   // note: exe_sym_ is used when layout is same for all instances of program
@@ -237,12 +224,13 @@ private:
 
   std::vector<std::unique_ptr<AttachedProbe>> attach_usdt_probe(
       Probe &probe,
-      BpfProgram &&program,
+      const BpfProgram &program,
       int pid,
       bool file_activation);
   int setup_output();
   int setup_perf_events();
-  int setup_ringbuf();
+  void setup_ringbuf();
+  int setup_event_loss();
   // when the ringbuf feature is available, enable ringbuf for built-ins like
   // printf, cat.
   bool is_ringbuf_enabled(void) const
@@ -258,17 +246,19 @@ private:
   void teardown_output();
   void poll_output(bool drain = false);
   int poll_perf_events();
-  void handle_ringbuf_loss();
+  void handle_event_loss();
   int print_map_hist(const BpfMap &map, uint32_t top, uint32_t div);
   int print_map_stats(const BpfMap &map, uint32_t top, uint32_t div);
   static uint64_t read_address_from_output(std::string output);
   std::optional<std::vector<uint8_t>> find_empty_key(const BpfMap &map) const;
   struct bcc_symbol_option &get_symbol_opts();
-  Probe generate_probe(const ast::AttachPoint &ap, const ast::Probe &p);
+  Probe generate_probe(const ast::AttachPoint &ap,
+                       const ast::Probe &p,
+                       int usdt_location_idx = 0);
   bool has_iter_ = false;
   int epollfd_ = -1;
   struct ring_buffer *ringbuf_ = nullptr;
-  uint64_t ringbuf_loss_count_ = 0;
+  uint64_t event_loss_count_ = 0;
 
   // Mapping traceable functions to modules (or "vmlinux") they appear in.
   // Needs to be mutable to allow lazy loading of the mapping from const lookup

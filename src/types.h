@@ -3,6 +3,7 @@
 #include <cassert>
 #include <map>
 #include <memory>
+#include <optional>
 #include <ostream>
 #include <sstream>
 #include <string>
@@ -153,7 +154,9 @@ private:
                                        // StructManager
   AddrSpace as_ = AddrSpace::none;
   bool is_signed_ = false;
-  bool ctx_ = false; // Is bpf program context
+  bool ctx_ = false;                                   // Is bpf program context
+  std::unordered_set<std::string> btf_type_tags_ = {}; // Only populated for
+                                                       // Type::pointer
 
   friend class cereal::access;
   template <typename Archive>
@@ -206,6 +209,18 @@ public:
     as_ = as;
   }
 
+  void SetBtfTypeTags(std::unordered_set<std::string> &&tags)
+  {
+    assert(IsPtrTy());
+    btf_type_tags_ = std::move(tags);
+  }
+
+  const std::unordered_set<std::string> &GetBtfTypeTags() const
+  {
+    assert(IsPtrTy());
+    return btf_type_tags_;
+  }
+
   bool IsCtxAccess() const
   {
     return ctx_;
@@ -240,13 +255,27 @@ public:
     return size_bits_ / 8;
   }
 
-  void SetSize(size_t size)
+  void SetSize(size_t byte_size)
   {
-    size_bits_ = size * 8;
-    if (IsIntTy()) {
-      assert(size == 0 || size == 1 || size == 8 || size == 16 || size == 32 ||
-             size == 64);
-    }
+    if (IsIntTy())
+      SetIntBitWidth(byte_size * 8);
+    else
+      size_bits_ = byte_size * 8;
+  }
+
+  void SetIntBitWidth(size_t bits)
+  {
+    assert(IsIntTy());
+    // Truncate integers too large to fit in BPF registers (64-bits).
+    if (bits > 64)
+      bits = 64;
+    // Zero sized integers are not usually valid. However, during semantic
+    // analysis when we're inferring types, the first pass may not have
+    // enough information to figure out the exact size of the integer. Later
+    // passes infer the exact size.
+    assert(bits == 0 || bits == 1 || bits == 8 || bits == 16 || bits == 32 ||
+           bits == 64);
+    size_bits_ = bits;
   }
 
   size_t GetIntBitWidth() const
@@ -412,6 +441,16 @@ public:
   {
     return type_ == Type::timestamp_mode;
   }
+  bool IsCastableMapTy() const
+  {
+    return type_ == Type::count || type_ == Type::sum || type_ == Type::max ||
+           type_ == Type::min || type_ == Type::avg;
+  }
+  bool IsMapIterableTy() const
+  {
+    return !(type_ == Type::avg || type_ == Type::hist ||
+             type_ == Type::lhist || type_ == Type::stats);
+  }
 
   friend std::ostream &operator<<(std::ostream &, const SizedType &);
   friend std::ostream &operator<<(std::ostream &, Type);
@@ -511,26 +550,54 @@ struct ProbeItem {
 };
 
 const std::vector<ProbeItem> PROBE_LIST = {
-  { "kprobe", { "k" }, ProbeType::kprobe, .show_in_kernel_list = true },
-  { "kretprobe", { "kr" }, ProbeType::kretprobe },
-  { "uprobe", { "u" }, ProbeType::uprobe, .show_in_userspace_list = true },
-  { "uretprobe", { "ur" }, ProbeType::uretprobe },
-  { "usdt", { "U" }, ProbeType::usdt, .show_in_userspace_list = true },
-  { "BEGIN", { "BEGIN" }, ProbeType::special },
-  { "END", { "END" }, ProbeType::special },
-  { "tracepoint", { "t" }, ProbeType::tracepoint, .show_in_kernel_list = true },
-  { "profile", { "p" }, ProbeType::profile },
-  { "interval", { "i" }, ProbeType::interval },
-  { "software", { "s" }, ProbeType::software, .show_in_kernel_list = true },
-  { "hardware", { "h" }, ProbeType::hardware, .show_in_kernel_list = true },
-  { "watchpoint", { "w" }, ProbeType::watchpoint },
-  { "asyncwatchpoint", { "aw" }, ProbeType::asyncwatchpoint },
-  { "kfunc", { "f", "fentry" }, ProbeType::kfunc, .show_in_kernel_list = true },
-  { "kretfunc", { "fr", "fexit" }, ProbeType::kretfunc },
-  { "iter", { "it" }, ProbeType::iter, .show_in_kernel_list = true },
-  { "rawtracepoint",
-    { "rt" },
-    ProbeType::rawtracepoint,
+  { .name = "kprobe",
+    .aliases = { "k" },
+    .type = ProbeType::kprobe,
+    .show_in_kernel_list = true },
+  { .name = "kretprobe", .aliases = { "kr" }, .type = ProbeType::kretprobe },
+  { .name = "uprobe",
+    .aliases = { "u" },
+    .type = ProbeType::uprobe,
+    .show_in_userspace_list = true },
+  { .name = "uretprobe", .aliases = { "ur" }, .type = ProbeType::uretprobe },
+  { .name = "usdt",
+    .aliases = { "U" },
+    .type = ProbeType::usdt,
+    .show_in_userspace_list = true },
+  { .name = "BEGIN", .aliases = { "BEGIN" }, .type = ProbeType::special },
+  { .name = "END", .aliases = { "END" }, .type = ProbeType::special },
+  { .name = "tracepoint",
+    .aliases = { "t" },
+    .type = ProbeType::tracepoint,
+    .show_in_kernel_list = true },
+  { .name = "profile", .aliases = { "p" }, .type = ProbeType::profile },
+  { .name = "interval", .aliases = { "i" }, .type = ProbeType::interval },
+  { .name = "software",
+    .aliases = { "s" },
+    .type = ProbeType::software,
+    .show_in_kernel_list = true },
+  { .name = "hardware",
+    .aliases = { "h" },
+    .type = ProbeType::hardware,
+    .show_in_kernel_list = true },
+  { .name = "watchpoint", .aliases = { "w" }, .type = ProbeType::watchpoint },
+  { .name = "asyncwatchpoint",
+    .aliases = { "aw" },
+    .type = ProbeType::asyncwatchpoint },
+  { .name = "kfunc",
+    .aliases = { "f", "fentry" },
+    .type = ProbeType::kfunc,
+    .show_in_kernel_list = true },
+  { .name = "kretfunc",
+    .aliases = { "fr", "fexit" },
+    .type = ProbeType::kretfunc },
+  { .name = "iter",
+    .aliases = { "it" },
+    .type = ProbeType::iter,
+    .show_in_kernel_list = true },
+  { .name = "rawtracepoint",
+    .aliases = { "rt" },
+    .type = ProbeType::rawtracepoint,
     .show_in_kernel_list = true },
 };
 

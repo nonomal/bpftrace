@@ -8,7 +8,9 @@
 #include "bpffeature.h"
 #include "bpfprogram.h"
 #include "btf.h"
+#include "config.h"
 #include "types.h"
+#include "usdt.h"
 
 #include <bcc/libbpf.h>
 
@@ -21,15 +23,13 @@ std::string progtypeName(libbpf::bpf_prog_type t);
 class AttachedProbe {
 public:
   AttachedProbe(Probe &probe,
-                BpfProgram &&prog,
+                const BpfProgram &prog,
                 bool safe_mode,
-                BPFfeature &feature,
-                BTF &btf);
+                BPFtrace &bpftrace);
   AttachedProbe(Probe &probe,
-                BpfProgram &&prog,
+                const BpfProgram &prog,
                 int pid,
-                BPFfeature &feature,
-                BTF &btf,
+                BPFtrace &bpftrace,
                 bool safe_mode = true);
   ~AttachedProbe();
   AttachedProbe(const AttachedProbe &) = delete;
@@ -43,7 +43,7 @@ private:
   std::string eventprefix() const;
   std::string eventname() const;
   void resolve_offset_kprobe(bool safe_mode);
-  bool resolve_offset_uprobe(bool safe_mode);
+  bool resolve_offset_uprobe(bool safe_mode, bool has_multiple_aps);
   void load_prog(BPFfeature &feature);
   void attach_multi_kprobe(void);
   void attach_multi_uprobe(int pid);
@@ -78,19 +78,19 @@ private:
   int detach_raw_tracepoint(void);
 
   static std::map<std::string, int> cached_prog_fds_;
-  bool use_cached_progfd(void);
+  bool use_cached_progfd(BPFfeature &feature);
   void cache_progfd(void);
 
   Probe &probe_;
-  BpfProgram prog_;
   std::vector<int> perf_event_fds_;
   bool close_progfd_ = true;
   int progfd_ = -1;
   uint64_t offset_ = 0;
   int tracing_fd_ = -1;
   std::function<void()> usdt_destructor_;
+  USDTHelper usdt_helper;
 
-  BTF &btf_;
+  BPFtrace &bpftrace_;
 };
 
 class HelperVerifierError : public std::runtime_error {

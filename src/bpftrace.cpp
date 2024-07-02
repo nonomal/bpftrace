@@ -1,3 +1,4 @@
+#include "btf.h"
 #include <algorithm>
 #include <arpa/inet.h>
 #include <cassert>
@@ -45,9 +46,10 @@
 
 namespace bpftrace {
 
-DebugLevel bt_debug = DebugLevel::kNone;
+std::set<DebugStage> bt_debug = {};
 bool bt_quiet = false;
 bool bt_verbose = false;
+bool dry_run = false;
 volatile sig_atomic_t BPFtrace::exitsig_recv = false;
 volatile sig_atomic_t BPFtrace::sigusr1_recv = false;
 
@@ -81,7 +83,9 @@ Probe BPFtrace::generateWatchpointSetupProbe(const ast::AttachPoint &ap,
   return setup_probe;
 }
 
-Probe BPFtrace::generate_probe(const ast::AttachPoint &ap, const ast::Probe &p)
+Probe BPFtrace::generate_probe(const ast::AttachPoint &ap,
+                               const ast::Probe &p,
+                               int usdt_location_idx)
 {
   Probe probe;
   probe.path = ap.target;
@@ -96,6 +100,7 @@ Probe BPFtrace::generate_probe(const ast::AttachPoint &ap, const ast::Probe &p)
   probe.address = ap.address;
   probe.func_offset = ap.func_offset;
   probe.loc = 0;
+  probe.usdt_location_idx = usdt_location_idx;
   probe.index = ap.index() ?: p.index();
   probe.len = ap.len;
   probe.mode = ap.mode;
@@ -104,237 +109,110 @@ Probe BPFtrace::generate_probe(const ast::AttachPoint &ap, const ast::Probe &p)
   return probe;
 }
 
-int BPFtrace::add_probe(ast::Probe &p)
+int BPFtrace::add_probe(const ast::AttachPoint &ap,
+                        const ast::Probe &p,
+                        int usdt_location_idx)
 {
-  for (auto attach_point : *p.attach_points) {
-    if (attach_point->provider == "BEGIN" || attach_point->provider == "END") {
-      auto probe = generate_probe(*attach_point, p);
-      probe.path = "/proc/self/exe";
-      probe.attach_point = attach_point->provider + "_trigger";
-      probe.name = p.name();
-      resources.special_probes.push_back(probe);
-      continue;
-    }
+  auto type = probetype(ap.provider);
+  auto probe = generate_probe(ap, p, usdt_location_idx);
 
-    std::vector<std::string> attach_funcs;
-    // An underspecified usdt probe is a probe that has no wildcards and
-    // either an empty namespace or a specified PID.
-    // We try to find a unique match for such a probe.
-    bool underspecified_usdt_probe = probetype(attach_point->provider) ==
-                                         ProbeType::usdt &&
-                                     !has_wildcard(attach_point->target) &&
-                                     !has_wildcard(attach_point->ns) &&
-                                     !has_wildcard(attach_point->func) &&
-                                     (attach_point->ns.empty() || pid() > 0);
-    if (attach_point->need_expansion &&
-        (has_wildcard(attach_point->func) ||
-         has_wildcard(attach_point->target) || has_wildcard(attach_point->ns) ||
-         underspecified_usdt_probe)) {
-      std::set<std::string> matches;
-      try {
-        matches = probe_matcher_->get_matches_for_ap(*attach_point);
-      } catch (const WildcardException &e) {
-        LOG(ERROR) << e.what();
-        return 1;
-      }
+  // Add the new probe(s) to resources
+  if (ap.provider == "BEGIN" || ap.provider == "END") {
+    // special probes
+    probe.path = "/proc/self/exe";
+    probe.attach_point = ap.provider + "_trigger";
+    resources.special_probes.push_back(std::move(probe));
+  } else if ((type == ProbeType::watchpoint ||
+              type == ProbeType::asyncwatchpoint) &&
+             ap.func.size()) {
+    // (async)watchpoint - generate also the setup probe
+    resources.probes.emplace_back(generateWatchpointSetupProbe(ap, p));
+    resources.watchpoint_probes.emplace_back(std::move(probe));
+  } else if (ap.expansion == ast::ExpansionType::MULTI) {
+    // (k|u)probe_multi - do expansion and set probe.funcs
+    auto matches = probe_matcher_->get_matches_for_ap(ap);
+    if (matches.empty())
+      return 1;
 
-      if (underspecified_usdt_probe && matches.size() > 1) {
-        LOG(ERROR) << "namespace for " << attach_point->name()
-                   << " not specified, matched " << matches.size()
-                   << " probes. Please specify a unique namespace or use '*' "
-                      "to attach "
-                   << "to all matched probes";
-        return 1;
-      }
-
-      attach_funcs.insert(attach_funcs.end(), matches.begin(), matches.end());
-
-      if (feature_->has_kprobe_multi() && has_wildcard(attach_point->func) &&
-          !p.need_expansion && attach_funcs.size() &&
-          (probetype(attach_point->provider) == ProbeType::kprobe ||
-           probetype(attach_point->provider) == ProbeType::kretprobe) &&
-          attach_point->target.empty()) {
-        auto probe = generate_probe(*attach_point, p);
-        probe.funcs = attach_funcs;
-        resources.probes.push_back(probe);
-        continue;
-      }
-
-      if ((probetype(attach_point->provider) == ProbeType::uprobe ||
-           probetype(attach_point->provider) == ProbeType::uretprobe) &&
-          feature_->has_uprobe_multi() && has_wildcard(attach_point->func) &&
-          !p.need_expansion && attach_funcs.size()) {
-        if (!has_wildcard(attach_point->target)) {
-          auto probe = generate_probe(*attach_point, p);
-          probe.funcs = attach_funcs;
-          resources.probes.push_back(probe);
-          continue;
+    if (has_wildcard(ap.target)) {
+      // If we have a wildcard in the target path, we need to generate one
+      // probe per expanded target.
+      assert(type == ProbeType::uprobe || type == ProbeType::uretprobe);
+      std::unordered_map<std::string, Probe> target_map;
+      for (const auto &func : matches) {
+        ast::AttachPoint match_ap = ap.create_expansion_copy(func);
+        // Use the original (possibly wildcarded) function name
+        match_ap.func = ap.func;
+        auto found = target_map.find(match_ap.target);
+        if (found != target_map.end()) {
+          found->second.funcs.push_back(func);
         } else {
-          // If we have a wildcard in the target path, we need to generate one
-          // probe per expanded target.
-          std::unordered_map<std::string, Probe> target_map;
-          for (const auto &func : attach_funcs) {
-            ast::AttachPoint ap = attach_point->create_expansion_copy(func);
-            // Use the original (possibly wildcarded) function name
-            ap.func = attach_point->func;
-            auto found = target_map.find(ap.target);
-            if (found != target_map.end()) {
-              found->second.funcs.push_back(func);
-            } else {
-              auto probe = generate_probe(ap, p);
-              probe.funcs.push_back(func);
-              target_map.insert({ { ap.target, probe } });
-            }
-          }
-          for (auto &pair : target_map) {
-            resources.probes.push_back(std::move(pair.second));
-          }
-          continue;
+          auto probe = generate_probe(match_ap, p);
+          probe.funcs.push_back(func);
+          target_map.insert({ { match_ap.target, probe } });
         }
       }
-    } else if ((probetype(attach_point->provider) == ProbeType::uprobe ||
-                probetype(attach_point->provider) == ProbeType::uretprobe ||
-                probetype(attach_point->provider) == ProbeType::watchpoint ||
-                probetype(attach_point->provider) ==
-                    ProbeType::asyncwatchpoint) &&
-               !attach_point->func.empty()) {
-      std::set<std::string> matches;
-
-      struct symbol sym = {};
-      int err = resolve_uname(attach_point->func, &sym, attach_point->target);
-
-      if (attach_point->lang == "cpp") {
-        // As the C++ language supports function overload, a given function name
-        // (without parameters) could have multiple matches even when no
-        // wildcards are used.
-        matches = probe_matcher_->get_matches_for_ap(*attach_point);
+      for (auto &pair : target_map) {
+        resources.probes.push_back(std::move(pair.second));
       }
-
-      if (err >= 0 && sym.address != 0)
-        matches.insert(attach_point->target + ":" + attach_point->func);
-
-      attach_funcs.insert(attach_funcs.end(), matches.begin(), matches.end());
     } else {
-      if (probetype(attach_point->provider) == ProbeType::usdt &&
-          !attach_point->ns.empty())
-        attach_funcs.push_back(attach_point->target + ":" + attach_point->ns +
-                               ":" + attach_point->func);
-      else if (probetype(attach_point->provider) == ProbeType::tracepoint ||
-               probetype(attach_point->provider) == ProbeType::uprobe ||
-               probetype(attach_point->provider) == ProbeType::uretprobe ||
-               probetype(attach_point->provider) == ProbeType::kfunc ||
-               probetype(attach_point->provider) == ProbeType::kretfunc)
-        attach_funcs.push_back(attach_point->target + ":" + attach_point->func);
-      else if ((probetype(attach_point->provider) == ProbeType::kprobe ||
-                probetype(attach_point->provider) == ProbeType::kretprobe) &&
-               !attach_point->target.empty()) {
-        attach_funcs.push_back(attach_point->target + ":" + attach_point->func);
-      } else {
-        attach_funcs.push_back(attach_point->func);
-      }
+      probe.funcs = std::vector<std::string>(matches.begin(), matches.end());
+      resources.probes.push_back(std::move(probe));
     }
+  } else if (probetype(ap.provider) == ProbeType::uprobe) {
+    bool locations_from_dwarf = false;
 
-    // You may notice that the below loop is somewhat duplicated in
-    // codegen_llvm.cpp. The reason is because codegen tries to avoid
-    // generating duplicate programs if it can be avoided. For example, a
-    // program `kprobe:do_* { print("hi") }` can be generated once and reused
-    // for multiple attachpoints. Thus, we need this loop here to attach the
-    // single program to multiple attach points.
-    //
-    // There may be a way to refactor and unify the codepaths in a clean manner
-    // but so far it has eluded your author.
-    for (const auto &f : attach_funcs) {
-      ast::AttachPoint match_ap = attach_point->create_expansion_copy(f);
-
-      if (probetype(attach_point->provider) == ProbeType::usdt) {
-        // Necessary for correct number of locations if wildcard expands to
-        // multiple probes.
-        std::optional<usdt_probe_entry> usdt;
-        if ((p.need_expansion || match_ap.need_expansion) &&
-            (usdt = USDTHelper::find(
-                 this->pid(), match_ap.target, match_ap.ns, match_ap.func))) {
-          match_ap.usdt = *usdt;
-        }
-      } else if (probetype(attach_point->provider) == ProbeType::iter) {
-        has_iter_ = true;
-      }
-
-      auto probe = generate_probe(match_ap, p);
-
-      if (probetype(attach_point->provider) == ProbeType::usdt) {
-        // We must attach to all locations of a USDT marker if duplicates exist
-        // in a target binary. See comment in codegen_llvm.cpp probe generation
-        // code for more details.
-        for (int i = 0; i < match_ap.usdt.num_locations; ++i) {
+    // If the user specified an address/offset, do not overwrite
+    // their choice with locations from the DebugInfo.
+    if (probe.address == 0 && probe.func_offset == 0) {
+      // Get function locations from the DebugInfo, as it skips the
+      // prologue and also returns locations of inlined function calls.
+      if (auto *dwarf = get_dwarf(probe.path)) {
+        const auto locations = dwarf->get_function_locations(
+            probe.attach_point, config_.get(ConfigKeyBool::probe_inline));
+        for (const auto loc : locations) {
+          // Clear the attach point, so the address will be used instead
           Probe probe_copy = probe;
-          probe_copy.usdt_location_idx = i;
-          probe_copy.index = attach_point->index() > 0 ? attach_point->index()
-                                                       : p.index();
+          probe_copy.attach_point.clear();
+          probe_copy.address = loc;
+          resources.probes.push_back(std::move(probe_copy));
 
-          resources.probes.emplace_back(std::move(probe_copy));
+          locations_from_dwarf = true;
         }
-      } else if ((probetype(attach_point->provider) == ProbeType::watchpoint ||
-                  probetype(attach_point->provider) ==
-                      ProbeType::asyncwatchpoint) &&
-                 attach_point->func.size()) {
-        resources.probes.emplace_back(
-            generateWatchpointSetupProbe(match_ap, p));
-
-        resources.watchpoint_probes.emplace_back(std::move(probe));
-      } else if (probetype(attach_point->provider) == ProbeType::uprobe) {
-        bool locations_from_dwarf = false;
-
-        // If the user specified an address/offset, do not overwrite
-        // their choice with locations from the DebugInfo.
-        if (probe.address == 0 && probe.func_offset == 0) {
-          // Get function locations from the DebugInfo, as it skips the
-          // prologue and also returns locations of inlined function calls.
-          if (auto *dwarf = get_dwarf(probe.path)) {
-            const auto locations = dwarf->get_function_locations(
-                probe.attach_point, config_.get(ConfigKeyBool::probe_inline));
-            for (const auto loc : locations) {
-              // Clear the attach point, so the address will be used instead
-              Probe probe_copy = probe;
-              probe_copy.attach_point.clear();
-              probe_copy.address = loc;
-              resources.probes.push_back(std::move(probe_copy));
-
-              locations_from_dwarf = true;
-            }
-          }
-        }
-
-        // Otherwise, use the location from the symbol table.
-        if (!locations_from_dwarf)
-          resources.probes.push_back(std::move(probe));
-      } else {
-        resources.probes.push_back(probe);
       }
     }
 
-    if (resources.probes_using_usym.find(&p) !=
-            resources.probes_using_usym.end() &&
-        bcc_elf_is_exe(attach_point->target.c_str())) {
-      auto user_symbol_cache_type = config_.get(
-          ConfigKeyUserSymbolCacheType::default_);
-      // preload symbol table for executable to make it available even if the
-      // binary is not present at symbol resolution time
-      // note: this only makes sense with ASLR disabled, since with ASLR offsets
-      // might be different
-      if (user_symbol_cache_type == UserSymbolCacheType::per_program &&
-          symbol_table_cache_.find(attach_point->target) ==
-              symbol_table_cache_.end())
-        symbol_table_cache_[attach_point->target] = get_symbol_table_for_elf(
-            attach_point->target);
+    // Otherwise, use the location from the symbol table.
+    if (!locations_from_dwarf)
+      resources.probes.push_back(std::move(probe));
+  } else {
+    resources.probes.emplace_back(std::move(probe));
+  }
 
-      if (user_symbol_cache_type == UserSymbolCacheType::per_pid)
-        // preload symbol tables from running processes
-        // this allows symbol resolution for processes that are running at probe
-        // attach time, but not at symbol resolution time, even with ASLR
-        // enabled, since BCC symcache records the offsets
-        for (int pid : get_pids_for_program(attach_point->target))
-          pid_sym_[pid] = bcc_symcache_new(pid, &get_symbol_opts());
-    }
+  if (type == ProbeType::iter)
+    has_iter_ = true;
+
+  // Preload symbol tables if necessary
+  if (resources.probes_using_usym.find(&p) !=
+          resources.probes_using_usym.end() &&
+      is_exe(ap.target)) {
+    auto user_symbol_cache_type = config_.get(
+        ConfigKeyUserSymbolCacheType::default_);
+    // preload symbol table for executable to make it available even if the
+    // binary is not present at symbol resolution time
+    // note: this only makes sense with ASLR disabled, since with ASLR offsets
+    // might be different
+    if (user_symbol_cache_type == UserSymbolCacheType::per_program &&
+        symbol_table_cache_.find(ap.target) == symbol_table_cache_.end())
+      symbol_table_cache_[ap.target] = get_symbol_table_for_elf(ap.target);
+
+    if (user_symbol_cache_type == UserSymbolCacheType::per_pid)
+      // preload symbol tables from running processes
+      // this allows symbol resolution for processes that are running at probe
+      // attach time, but not at symbol resolution time, even with ASLR
+      // enabled, since BCC symcache records the offsets
+      for (int pid : get_pids_for_program(ap.target))
+        pid_sym_[pid] = bcc_symcache_new(pid, &get_symbol_opts());
   }
 
   return 0;
@@ -676,12 +554,14 @@ std::vector<std::unique_ptr<IPrintable>> BPFtrace::get_arg_values(
             config_.get(ConfigKeyString::str_trunc_trailer).c_str()));
         break;
       }
-      case Type::buffer:
+      case Type::buffer: {
+        auto length =
+            reinterpret_cast<AsyncEvent::Buf *>(arg_data + arg.offset)->length;
         arg_values.push_back(std::make_unique<PrintableBuffer>(
             reinterpret_cast<AsyncEvent::Buf *>(arg_data + arg.offset)->content,
-            reinterpret_cast<AsyncEvent::Buf *>(arg_data + arg.offset)
-                ->length));
+            length));
         break;
+      }
       case Type::ksym:
         arg_values.push_back(std::make_unique<PrintableString>(resolve_ksym(
             *reinterpret_cast<uint64_t *>(arg_data + arg.offset))));
@@ -792,7 +672,7 @@ void perf_event_lost(void *cb_cookie, uint64_t lost)
 
 std::vector<std::unique_ptr<AttachedProbe>> BPFtrace::attach_usdt_probe(
     Probe &probe,
-    BpfProgram &&program,
+    const BpfProgram &program,
     int pid,
     bool file_activation)
 {
@@ -800,8 +680,8 @@ std::vector<std::unique_ptr<AttachedProbe>> BPFtrace::attach_usdt_probe(
 
   if (feature_->has_uprobe_refcnt() ||
       !(file_activation && probe.path.size())) {
-    ret.emplace_back(std::make_unique<AttachedProbe>(
-        probe, std::move(program), pid, *feature_, *btf_));
+    ret.emplace_back(
+        std::make_unique<AttachedProbe>(probe, program, pid, *this));
     return ret;
   }
 
@@ -854,8 +734,8 @@ std::vector<std::unique_ptr<AttachedProbe>> BPFtrace::attach_usdt_probe(
         throw FatalUserException("failed to parse pid=" + pid_str);
       }
 
-      ret.emplace_back(std::make_unique<AttachedProbe>(
-          probe, std::move(program), pid_parsed, *feature_, *btf_));
+      ret.emplace_back(
+          std::make_unique<AttachedProbe>(probe, program, pid_parsed, *this));
       break;
     }
   }
@@ -871,52 +751,13 @@ std::vector<std::unique_ptr<AttachedProbe>> BPFtrace::attach_probe(
     const BpfBytecode &bytecode)
 {
   std::vector<std::unique_ptr<AttachedProbe>> ret;
-  // use the single-probe program if it exists (as is the case with wildcards
-  // and the name builtin, which must be expanded into separate programs per
-  // probe), else try to find a the program based on the original probe name
-  // that includes wildcards.
-  auto usdt_location_idx = (probe.type == ProbeType::usdt)
-                               ? std::make_optional<int>(
-                                     probe.usdt_location_idx)
-                               : std::nullopt;
-
-  auto name = get_function_name_for_probe(probe.name,
-                                          probe.index,
-                                          usdt_location_idx);
-  auto orig_name = get_function_name_for_probe(probe.orig_name,
-                                               probe.index,
-                                               usdt_location_idx);
-
-  auto program = BpfProgram::CreateFromBytecode(bytecode, name);
-  if (!program) {
-    auto orig_program = BpfProgram::CreateFromBytecode(bytecode, orig_name);
-    if (orig_program)
-      program.emplace(std::move(*orig_program));
-  }
-
-  if (!program) {
-    if (probe.name != probe.orig_name)
-      LOG(ERROR) << "Code not generated for probe: " << probe.name
-                 << " from: " << probe.orig_name;
-    else
-      LOG(ERROR) << "Code not generated for probe: " << probe.name;
-    return ret;
-  }
 
   try {
-    program->assemble();
-  } catch (const std::exception &ex) {
-    LOG(ERROR) << "Failed to assemble program for probe: " << probe.name << ", "
-               << ex.what();
-    return ret;
-  }
-
-  try {
+    auto &program = bytecode.getProgramForProbe(probe);
     pid_t pid = child_ ? child_->pid() : this->pid();
 
     if (probe.type == ProbeType::usdt) {
-      auto aps = attach_usdt_probe(
-          probe, std::move(*program), pid, usdt_file_activation_);
+      auto aps = attach_usdt_probe(probe, program, pid, usdt_file_activation_);
       for (auto &ap : aps)
         ret.emplace_back(std::move(ap));
 
@@ -924,27 +765,21 @@ std::vector<std::unique_ptr<AttachedProbe>> BPFtrace::attach_probe(
     } else if (probe.type == ProbeType::uprobe ||
                probe.type == ProbeType::uretprobe) {
       ret.emplace_back(std::make_unique<AttachedProbe>(
-          probe, std::move(*program), pid, *feature_, *btf_, safe_mode_));
+          probe, program, pid, *this, safe_mode_));
       return ret;
     } else if (probe.type == ProbeType::watchpoint ||
                probe.type == ProbeType::asyncwatchpoint) {
-      ret.emplace_back(std::make_unique<AttachedProbe>(
-          probe, std::move(*program), pid, *feature_, *btf_));
+      ret.emplace_back(
+          std::make_unique<AttachedProbe>(probe, program, pid, *this));
       return ret;
     } else {
-      ret.emplace_back(std::make_unique<AttachedProbe>(
-          probe, std::move(*program), safe_mode_, *feature_, *btf_));
+      ret.emplace_back(
+          std::make_unique<AttachedProbe>(probe, program, safe_mode_, *this));
       return ret;
     }
   } catch (const EnospcException &e) {
     // Caller will handle
     throw e;
-  } catch (const HelperVerifierError &e) {
-    if (helper_use_loc_.find(e.func_id) != helper_use_loc_.end()) {
-      LOG(ERROR, helper_use_loc_[e.func_id], std::cerr) << e.what();
-    } else {
-      LOG(ERROR) << e.what();
-    }
   } catch (const std::exception &e) {
     LOG(ERROR) << e.what();
     ret.clear();
@@ -982,7 +817,7 @@ bool attach_reverse(const Probe &p)
 }
 
 int BPFtrace::run_special_probe(std::string name,
-                                const BpfBytecode &bytecode,
+                                BpfBytecode &bytecode,
                                 trigger_fn_t trigger)
 {
   for (auto probe = resources.special_probes.rbegin();
@@ -1115,6 +950,20 @@ int BPFtrace::run(BpfBytecode bytecode)
   bytecode_ = std::move(bytecode);
   bytecode_.fixupBTF(*feature_);
 
+  try {
+    bytecode_.load_progs(resources, *btf_, *feature_);
+  } catch (const HelperVerifierError &e) {
+    if (helper_use_loc_.find(e.func_id) != helper_use_loc_.end()) {
+      LOG(ERROR, helper_use_loc_[e.func_id], std::cerr) << e.what();
+    } else {
+      LOG(ERROR) << e.what();
+    }
+    return -1;
+  } catch (const std::runtime_error &e) {
+    LOG(ERROR) << e.what();
+    return -1;
+  }
+
   err = setup_output();
   if (err)
     return err;
@@ -1214,6 +1063,9 @@ int BPFtrace::run(BpfBytecode bytecode)
                  << strerror(-err);
 #endif
 
+  if (dry_run)
+    exitsig_recv = true;
+
   if (has_iter_) {
     int err = run_iter();
     if (err)
@@ -1250,10 +1102,11 @@ int BPFtrace::run(BpfBytecode bytecode)
 int BPFtrace::setup_output()
 {
   if (is_ringbuf_enabled()) {
-    int err = setup_ringbuf();
-    if (err)
-      return err;
+    setup_ringbuf();
   }
+  int err = setup_event_loss();
+  if (err)
+    return err;
   if (is_perf_event_enabled()) {
     return setup_perf_events();
   }
@@ -1302,15 +1155,19 @@ int BPFtrace::setup_perf_events()
   return 0;
 }
 
-int BPFtrace::setup_ringbuf()
+void BPFtrace::setup_ringbuf()
 {
   ringbuf_ = static_cast<struct ring_buffer *>(ring_buffer__new(
       bytecode_.getMap(MapType::Ringbuf).fd, ringbuf_printer, this, nullptr));
-  if (bpf_update_elem(bytecode_.getMap(MapType::RingbufLossCounter).fd,
-                      const_cast<uint32_t *>(&rb_loss_cnt_key_),
-                      const_cast<uint64_t *>(&rb_loss_cnt_val_),
+}
+
+int BPFtrace::setup_event_loss()
+{
+  if (bpf_update_elem(bytecode_.getMap(MapType::EventLossCounter).fd,
+                      const_cast<uint32_t *>(&event_loss_cnt_key_),
+                      const_cast<uint64_t *>(&event_loss_cnt_val_),
                       0)) {
-    LOG(ERROR) << "fail to init ringbuf loss counter";
+    LOG(ERROR) << "fail to init event loss counter";
     return -1;
   }
   return 0;
@@ -1365,9 +1222,10 @@ void BPFtrace::poll_output(bool drain)
       }
     }
 
+    // print loss events
+    handle_event_loss();
+
     if (do_poll_ringbuf) {
-      // print loss events
-      handle_ringbuf_loss();
       ready = ring_buffer__poll(ringbuf_, timeout_ms);
       if (should_retry(ready)) {
         continue;
@@ -1409,21 +1267,21 @@ int BPFtrace::poll_perf_events()
   return ready;
 }
 
-void BPFtrace::handle_ringbuf_loss()
+void BPFtrace::handle_event_loss()
 {
   uint64_t current_value = 0;
-  if (bpf_lookup_elem(bytecode_.getMap(MapType::RingbufLossCounter).fd,
-                      const_cast<uint32_t *>(&rb_loss_cnt_key_),
+  if (bpf_lookup_elem(bytecode_.getMap(MapType::EventLossCounter).fd,
+                      const_cast<uint32_t *>(&event_loss_cnt_key_),
                       &current_value)) {
-    LOG(ERROR) << "fail to get ringbuf loss counter";
+    LOG(ERROR) << "fail to get event loss counter";
   }
   if (current_value) {
-    if (current_value > ringbuf_loss_count_) {
-      out_->lost_events(current_value - ringbuf_loss_count_);
-      ringbuf_loss_count_ = current_value;
-    } else if (current_value < ringbuf_loss_count_) {
-      LOG(ERROR) << "Invalid ringbuf loss count value: " << current_value
-                 << ", last seen: " << ringbuf_loss_count_;
+    if (current_value > event_loss_count_) {
+      out_->lost_events(current_value - event_loss_count_);
+      event_loss_count_ = current_value;
+    } else if (current_value < event_loss_count_) {
+      LOG(ERROR) << "Invalid event loss count value: " << current_value
+                 << ", last seen: " << event_loss_count_;
     }
   }
 }
@@ -1869,11 +1727,17 @@ std::string BPFtrace::resolve_timestamp(uint32_t mode,
   snprintf(usecs_buf, sizeof(usecs_buf), "%06" PRIu64, us);
   auto fmt = std::regex_replace(raw_fmt, usec_regex, usecs_buf);
 
-  char timestr[config_.get(ConfigKeyInt::max_strlen)];
-  if (strftime(timestr, sizeof(timestr), fmt.c_str(), &tmp) == 0) {
+  uint64_t timestr_size = config_.get(ConfigKeyInt::max_strlen);
+  std::string timestr(timestr_size, '\0');
+  size_t timestr_len = strftime(
+      timestr.data(), timestr_size, fmt.c_str(), &tmp);
+  if (timestr_len == 0) {
     LOG(ERROR) << "strftime returned 0";
     return "(?)";
   }
+
+  // Fit return value to formatted length
+  timestr.resize(timestr_len);
   return timestr;
 }
 
@@ -2337,6 +2201,47 @@ struct bcc_symbol_option &BPFtrace::get_symbol_opts()
   };
 
   return symopts;
+}
+
+int BPFtrace::get_num_possible_cpus() const
+{
+  return libbpf_num_possible_cpus();
+}
+
+/*
+ * This prevents an ABBA deadlock when attaching to spin lock internal
+ * functions e.g. "kfunc:queued_spin_lock_slowpath".
+ *
+ * Specifically, if there are two hash maps (non percpu) being accessed by
+ * two different CPUs by two bpf progs then we can get in a situation where,
+ * because there are progs attached to spin lock internals, a lock is taken for
+ * one map while a different lock is trying to be acquired for the other map.
+ * This is specific to kfunc/fentry kretfunc/fexit as kprobes have kernel
+ * protections against this type of deadlock.
+ *
+ * Note: it would be better if this was in resource analyzer but we need
+ * probe_matcher to get the list of functions for the attach point
+ */
+void BPFtrace::kfunc_recursion_check(ast::Program *prog)
+{
+  for (auto *probe : *prog->probes) {
+    for (auto *ap : *probe->attach_points) {
+      auto probe_type = probetype(ap->provider);
+      if (probe_type == ProbeType::kfunc || probe_type == ProbeType::kretfunc) {
+        auto matches = probe_matcher_->get_matches_for_ap(*ap);
+        for (const auto &match : matches) {
+          if (is_recursive_func(match)) {
+            LOG(WARNING)
+                << "Attaching to dangerous function: " << match
+                << ". bpftrace has added mitigations to prevent a kernel "
+                   "deadlock but they may result in some lost events.";
+            need_recursion_check_ = true;
+            return;
+          }
+        }
+      }
+    }
+  }
 }
 
 } // namespace bpftrace

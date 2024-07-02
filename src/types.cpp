@@ -2,6 +2,7 @@
 #include <cassert>
 #include <iostream>
 
+#include "ast/async_event_types.h"
 #include "bpftrace.h"
 #include "log.h"
 #include "struct.h"
@@ -144,7 +145,7 @@ std::string addrspacestr(AddrSpace as)
 std::string typestr(Type t)
 {
   switch (t) {
-    // clang-format off
+      // clang-format off
     case Type::none:     return "none";     break;
     case Type::voidtype: return "void";     break;
     case Type::integer:  return "integer";  break;
@@ -252,14 +253,8 @@ uint64_t asyncactionint(AsyncAction a)
 // Type wrappers
 SizedType CreateInteger(size_t bits, bool is_signed)
 {
-  // Zero sized integers are not usually valid. However, during semantic
-  // analysis when we're inferring types, the first pass may not have
-  // enough information to figure out the exact size of the integer. Later
-  // passes infer the exact size.
-  assert(bits == 0 || bits == 1 || bits == 8 || bits == 16 || bits == 32 ||
-         bits == 64);
   auto t = SizedType(Type::integer, 0, is_signed);
-  t.size_bits_ = bits;
+  t.SetIntBitWidth(bits);
   return t;
 }
 
@@ -440,7 +435,8 @@ SizedType CreateKSym()
 
 SizedType CreateBuffer(size_t size)
 {
-  return SizedType(Type::buffer, size);
+  auto metadata_headroom_bytes = sizeof(AsyncEvent::Buf);
+  return SizedType(Type::buffer, size + metadata_headroom_bytes);
 }
 
 SizedType CreateTimestamp()

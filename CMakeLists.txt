@@ -5,7 +5,7 @@ cmake_policy(SET CMP0057 NEW)
 
 # bpftrace version number components.
 set(bpftrace_VERSION_MAJOR 0)
-set(bpftrace_VERSION_MINOR 20)
+set(bpftrace_VERSION_MINOR 21)
 set(bpftrace_VERSION_PATCH 0)
 
 include(GNUInstallDirs)
@@ -22,6 +22,8 @@ set(BUILD_FUZZ OFF CACHE BOOL "Build bpftrace for fuzzing")
 set(USE_LIBFUZZER OFF CACHE BOOL "Use libfuzzer for fuzzing")
 set(FUZZ_TARGET "codegen" CACHE STRING "Fuzzing target")
 set(ENABLE_SYSTEMD OFF CACHE BOOL "Enable systemd integration")
+set(KERNEL_HEADERS_DIR "" CACHE PATH "Hard-code kernel headers directory")
+set(SYSTEM_INCLUDE_PATHS "auto" CACHE STRING "Hard-code system include paths (colon separated, the default value \"auto\" queries clang at runtime)")
 
 set(ENABLE_SKB_OUTPUT ON CACHE BOOL "Enable skb_output, will include libpcap")
 
@@ -33,6 +35,7 @@ set (CMAKE_CXX_EXTENSIONS OFF)
 
 add_compile_options("-Wall")
 add_compile_options("-Wextra")
+add_compile_options("-Werror=missing-field-initializers")
 add_compile_options("-Werror=undef")
 add_compile_options("-Wpointer-arith")
 add_compile_options("-Wcast-align")
@@ -83,6 +86,9 @@ include_directories(SYSTEM ${LIBBCC_INCLUDE_DIRS})
 
 find_package(LibBpf REQUIRED)
 include_directories(SYSTEM ${LIBBPF_INCLUDE_DIRS})
+if(LIBBPF_VERSION_MAJOR VERSION_LESS 1)
+  message(SEND_ERROR "bpftrace requires libbpf 1.0 or greater")
+endif()
 
 find_package(LibElf REQUIRED)
 include_directories(SYSTEM ${LIBELF_INCLUDE_DIRS})

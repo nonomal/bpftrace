@@ -9,6 +9,7 @@
 
 #include "arch/arch.h"
 #include "ast/ast.h"
+#include "ast/async_event_types.h"
 #include "ast/signal_bt.h"
 #include "collect_nodes.h"
 #include "config.h"
@@ -355,8 +356,7 @@ void SemanticAnalyser::visit(Builtin &builtin)
                "using the 'probe' builtin instead.";
       }
     }
-  } else if (!builtin.ident.compare(0, 3, "arg") && builtin.ident.size() == 4 &&
-             builtin.ident.at(3) >= '0' && builtin.ident.at(3) <= '9') {
+  } else if (builtin.is_argx()) {
     auto probe = get_probe_from_scope(scope_, builtin.loc, builtin.ident);
     if (probe == nullptr)
       return;
@@ -434,7 +434,7 @@ void SemanticAnalyser::visit(Builtin &builtin)
       ProbeType type = probetype(attach_point->provider);
 
       if (type == ProbeType::tracepoint) {
-        probe->need_expansion = true;
+        attach_point->expansion = ExpansionType::FULL;
         builtin_args_tracepoint(attach_point, builtin);
       }
     }
@@ -709,6 +709,14 @@ void SemanticAnalyser::visit(Call &call)
     }
     has_pos_param_ = false;
   } else if (call.func == "buf") {
+    const uint64_t max_strlen = bpftrace_.config_.get(ConfigKeyInt::max_strlen);
+    if (max_strlen >
+        std::numeric_limits<decltype(AsyncEvent::Buf::length)>::max()) {
+      LOG(ERROR, call.loc, err_)
+          << "BPFTRACE_MAX_STRLEN too large to use on buffer (" << max_strlen
+          << " > " << std::numeric_limits<uint32_t>::max() << ")";
+    }
+
     if (!check_varargs(call, 1, 2))
       return;
 
@@ -721,8 +729,9 @@ void SemanticAnalyser::visit(Call &call)
           << typestr(arg.type.GetTy());
     }
 
-    size_t max_buffer_size = bpftrace_.config_.get(ConfigKeyInt::max_strlen);
-    size_t buffer_size = max_buffer_size;
+    // Subtract out metadata headroom
+    uint32_t max_buffer_size = max_strlen - sizeof(AsyncEvent::Buf);
+    uint32_t buffer_size = max_buffer_size;
 
     if (call.vargs->size() == 1) {
       if (arg.type.IsArrayTy())
@@ -755,13 +764,11 @@ void SemanticAnalyser::visit(Call &call)
       if (is_final_pass())
         LOG(WARNING, call.loc, out_)
             << call.func << "() length is too long and will be shortened to "
-            << std::to_string(bpftrace_.config_.get(ConfigKeyInt::max_strlen))
-            << " bytes (see BPFTRACE_MAX_STRLEN)";
+            << std::to_string(max_strlen) << " bytes (see BPFTRACE_MAX_STRLEN)";
 
       buffer_size = max_buffer_size;
     }
 
-    buffer_size++; // extra byte is used to embed the length of the buffer
     call.type = CreateBuffer(buffer_size);
     // Consider case : $a = buf("hi", 2); $b = buf("bye", 3);  $a == $b
     // The result of buf is copied to bpf stack. Hence kernel probe read
@@ -834,8 +841,8 @@ void SemanticAnalyser::visit(Call &call)
       return;
     }
 
-    char dst[addr_size];
-    auto ret = inet_pton(af_type, addr.c_str(), &dst);
+    std::vector<char> dst(addr_size);
+    auto ret = inet_pton(af_type, addr.c_str(), dst.data());
     if (ret != 1) {
       LOG(ERROR, call.loc, err_)
           << call.func << "() expects a valid IPv4/IPv6 address, got " << addr;
@@ -1796,7 +1803,8 @@ void SemanticAnalyser::visit(Binop &binop)
     return;
   }
 
-  if (lht.IsIntTy() && rht.IsIntTy()) {
+  if ((lht.IsCastableMapTy() || lht.IsIntTy()) &&
+      (rht.IsCastableMapTy() || rht.IsIntTy())) {
     binop_int(binop);
   } else if (lht.IsArrayTy() && rht.IsArrayTy()) {
     binop_array(binop);
@@ -2065,6 +2073,13 @@ void SemanticAnalyser::visit(For &f)
    *     }
    */
 
+  if (scope_with_for_loop_.has_value() && *scope_with_for_loop_ != scope_) {
+    LOG(ERROR, f.loc, err_)
+        << "Currently, for-loops can be used only in a single probe.";
+  } else {
+    scope_with_for_loop_ = scope_;
+  }
+
   // Validate decl
   const auto &decl_name = f.decl->ident;
   if (variable_val_[scope_].find(decl_name) != variable_val_[scope_].end()) {
@@ -2078,6 +2093,12 @@ void SemanticAnalyser::visit(For &f)
     return;
   }
   Map &map = static_cast<Map &>(*f.expr);
+
+  if (!map.type.IsMapIterableTy()) {
+    LOG(ERROR, f.expr->loc, err_)
+        << "Loop expression does not support type: " << map.type;
+    return;
+  }
 
   // Validate body
   CollectNodes<Variable> vars_referenced;
@@ -2132,6 +2153,20 @@ void SemanticAnalyser::visit(For &f)
   loop_depth_++;
   accept_statements(f.stmts);
   loop_depth_--;
+
+  // Currently, we do not pass BPF context to the callback so disable builtins
+  // which require ctx access.
+  CollectNodes<Builtin> builtins;
+  for (auto *stmt : *f.stmts) {
+    builtins.run(*stmt);
+  }
+  for (const Builtin &builtin : builtins.nodes()) {
+    if (builtin.type.IsCtxAccess() || builtin.is_argx() ||
+        builtin.ident == "retval") {
+      LOG(ERROR, builtin.loc, err_)
+          << "'" << builtin.ident << "' builtin is not allowed in a for-loop";
+    }
+  }
 
   // Decl variable is not valid beyond this for-loop
   variable_val_[scope_].erase(decl_name);
@@ -2263,6 +2298,22 @@ void SemanticAnalyser::visit(FieldAccess &acc)
     } else {
       const auto &field = record->GetField(acc.field);
 
+      if (field.type.IsPtrTy()) {
+        const auto &tags = field.type.GetBtfTypeTags();
+        /*
+         * Currently only "rcu" is safe. "percpu", for example, requires special
+         * unwrapping with `bpf_per_cpu_ptr` which is not yet supported.
+         */
+        static const std::string_view allowed_tag = "rcu";
+        for (const auto &tag : tags) {
+          if (tag != allowed_tag) {
+            LOG(ERROR, acc.loc, err_)
+                << "Attempting to access pointer field '" << acc.field
+                << "' with unsupported tag attribute: " << tag;
+          }
+        }
+      }
+
       acc.type = field.type;
       if (acc.expr->type.IsCtxAccess() &&
           (acc.type.IsArrayTy() || acc.type.IsRecordTy())) {
@@ -2333,7 +2384,7 @@ void SemanticAnalyser::visit(Cast &cast)
   }
 
   if ((cast.type.IsIntTy() && !rhs.IsIntTy() && !rhs.IsPtrTy() &&
-       !rhs.IsCtxAccess() && !(rhs.IsArrayTy())) ||
+       !rhs.IsCtxAccess() && !rhs.IsArrayTy() && !rhs.IsCastableMapTy()) ||
       // casting from/to int arrays must respect the size
       (cast.type.IsArrayTy() &&
        (!rhs.IsIntTy() || cast.type.GetSize() != rhs.GetSize())) ||
@@ -2392,7 +2443,7 @@ void SemanticAnalyser::visit(AssignMapStatement &assignment)
   const std::string &map_ident = assignment.map->ident;
   auto type = assignment.expr->type;
 
-  if (type.IsRecordTy()) {
+  if (type.IsRecordTy() && map_val_[map_ident].IsRecordTy()) {
     std::string ty = assignment.expr->type.GetName();
     std::string stored_ty = map_val_[map_ident].GetName();
     if (!stored_ty.empty() && stored_ty != ty) {
@@ -2400,7 +2451,7 @@ void SemanticAnalyser::visit(AssignMapStatement &assignment)
           << "Type mismatch for " << map_ident << ": "
           << "trying to assign value of type '" << ty
           << "' when map already contains a value of type '" << stored_ty
-          << "''";
+          << "'";
     } else {
       map_val_[map_ident] = assignment.expr->type;
       map_val_[map_ident].is_internal = true;
@@ -2499,7 +2550,8 @@ void SemanticAnalyser::visit(AssignVarStatement &assignment)
       LOG(ERROR, assignment.loc, err_)
           << "Type mismatch for " << var_ident << ": "
           << "trying to assign value of type '" << assignTy.GetName()
-          << "' when variable already contains a value of type '" << storedTy;
+          << "' when variable already contains a value of type '" << storedTy
+          << "'";
     }
   } else if (assignTy.IsStringTy()) {
     auto var_size = storedTy.GetSize();
@@ -2563,7 +2615,9 @@ void SemanticAnalyser::visit(AttachPoint &ap)
       LOG(ERROR, ap.loc, err_) << "kprobes should be attached to a function";
     if (is_final_pass()) {
       // Warn if user tries to attach to a non-traceable function
-      if (!has_wildcard(ap.func) && !bpftrace_.is_traceable_func(ap.func)) {
+      if (bpftrace_.config_.get(ConfigKeyMissingProbes::default_) !=
+              ConfigMissingProbes::ignore &&
+          !has_wildcard(ap.func) && !bpftrace_.is_traceable_func(ap.func)) {
         LOG(WARNING, ap.loc, out_)
             << ap.func
             << " is not traceable (either non-existing, inlined, or marked as "
@@ -3195,7 +3249,7 @@ void SemanticAnalyser::assign_map_type(const Map &map, const SizedType &type)
       LOG(ERROR, map.loc, err_)
           << "Type mismatch for " << map_ident << ": "
           << "trying to assign value of type '" << type
-          << "' when map already contains a value of type '" << *maptype;
+          << "' when map already contains a value of type '" << *maptype << "'";
     }
 
     if (maptype->IsStringTy() || maptype->IsTupleTy())

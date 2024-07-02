@@ -16,7 +16,7 @@ target triple = "bpf-pc-linux"
 @stack_bpftrace_127 = dso_local global %"struct map_t.0" zeroinitializer, section ".maps", !dbg !25
 @stack_scratch = dso_local global %"struct map_t.1" zeroinitializer, section ".maps", !dbg !49
 @ringbuf = dso_local global %"struct map_t.2" zeroinitializer, section ".maps", !dbg !62
-@ringbuf_loss_counter = dso_local global %"struct map_t.3" zeroinitializer, section ".maps", !dbg !76
+@event_loss_counter = dso_local global %"struct map_t.3" zeroinitializer, section ".maps", !dbg !76
 
 ; Function Attrs: nounwind
 declare i64 @llvm.bpf.pseudo(i64 %0, i64 %1) #0
@@ -77,21 +77,20 @@ lookup_stack_scratch_failure:                     ; preds = %entry
   br label %stack_scratch_failure
 
 lookup_stack_scratch_merge:                       ; preds = %entry
+  %probe_read_kernel = call i64 inttoptr (i64 113 to i64 ([127 x i64]*, i32, i8*)*)([127 x i64]* %lookup_stack_scratch_map, i32 1016, i8* null)
   %20 = bitcast [127 x i64]* %lookup_stack_scratch_map to i8*
-  call void @llvm.memset.p0i8.i64(i8* align 1 %20, i8 0, i64 1016, i1 false)
-  %21 = bitcast [127 x i64]* %lookup_stack_scratch_map to i8*
-  %get_stack = call i32 inttoptr (i64 67 to i32 (i8*, i8*, i32, i64)*)(i8* %0, i8* %21, i32 1016, i64 256)
-  %22 = icmp sge i32 %get_stack, 0
-  br i1 %22, label %get_stack_success, label %get_stack_fail
+  %get_stack = call i32 inttoptr (i64 67 to i32 (i8*, i8*, i32, i64)*)(i8* %0, i8* %20, i32 1016, i64 256)
+  %21 = icmp sge i32 %get_stack, 0
+  br i1 %21, label %get_stack_success, label %get_stack_fail
 
 get_stack_success:                                ; preds = %lookup_stack_scratch_merge
-  %23 = udiv i32 %get_stack, 8
-  %24 = getelementptr %stack_key, %stack_key* %stack_key, i64 0, i32 1
-  store i32 %23, i32* %24, align 4
-  %25 = trunc i32 %23 to i8
-  %murmur_hash_2 = call i64 @murmur_hash_2(i8* %21, i8 %25, i64 1)
-  %26 = getelementptr %stack_key, %stack_key* %stack_key, i64 0, i32 0
-  store i64 %murmur_hash_2, i64* %26, align 8
+  %22 = udiv i32 %get_stack, 8
+  %23 = getelementptr %stack_key, %stack_key* %stack_key, i64 0, i32 1
+  store i32 %22, i32* %23, align 4
+  %24 = trunc i32 %22 to i8
+  %murmur_hash_2 = call i64 @murmur_hash_2(i8* %20, i8 %24, i64 1)
+  %25 = getelementptr %stack_key, %stack_key* %stack_key, i64 0, i32 0
+  store i64 %murmur_hash_2, i64* %25, align 8
   %update_elem = call i64 inttoptr (i64 2 to i64 (%"struct map_t.0"*, %stack_key*, [127 x i64]*, i64)*)(%"struct map_t.0"* @stack_bpftrace_127, %stack_key* %stack_key, [127 x i64]* %lookup_stack_scratch_map, i64 0)
   br label %merge_block
 
@@ -189,13 +188,9 @@ declare void @llvm.lifetime.start.p0i8(i64 immarg %0, i8* nocapture %1) #2
 ; Function Attrs: argmemonly nofree nosync nounwind willreturn
 declare void @llvm.lifetime.end.p0i8(i64 immarg %0, i8* nocapture %1) #2
 
-; Function Attrs: argmemonly nofree nosync nounwind willreturn writeonly
-declare void @llvm.memset.p0i8.i64(i8* nocapture writeonly %0, i8 %1, i64 %2, i1 immarg %3) #3
-
 attributes #0 = { nounwind }
 attributes #1 = { alwaysinline }
 attributes #2 = { argmemonly nofree nosync nounwind willreturn }
-attributes #3 = { argmemonly nofree nosync nounwind willreturn writeonly }
 
 !llvm.dbg.cu = !{!86}
 !llvm.module.flags = !{!89}
@@ -277,7 +272,7 @@ attributes #3 = { argmemonly nofree nosync nounwind willreturn writeonly }
 !74 = !{!75}
 !75 = !DISubrange(count: 262144, lowerBound: 0)
 !76 = !DIGlobalVariableExpression(var: !77, expr: !DIExpression())
-!77 = distinct !DIGlobalVariable(name: "ringbuf_loss_counter", linkageName: "global", scope: !2, file: !2, type: !78, isLocal: false, isDefinition: true)
+!77 = distinct !DIGlobalVariable(name: "event_loss_counter", linkageName: "global", scope: !2, file: !2, type: !78, isLocal: false, isDefinition: true)
 !78 = !DICompositeType(tag: DW_TAG_structure_type, scope: !2, file: !2, size: 256, elements: !79)
 !79 = !{!80, !58, !59, !85}
 !80 = !DIDerivedType(tag: DW_TAG_member, name: "type", scope: !2, file: !2, baseType: !81, size: 64)

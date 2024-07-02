@@ -348,6 +348,21 @@ const struct btf_type *BTF::btf_type_skip_modifiers(const struct btf_type *t,
   return t;
 }
 
+__u32 BTF::get_type_tags(std::unordered_set<std::string> &tags,
+                         const BTFId &btf_id) const
+{
+  __u32 id = btf_id.id;
+  const struct btf_type *t = btf__type_by_id(btf_id.btf, btf_id.id);
+
+  while (t && btf_is_type_tag(t)) {
+    tags.insert(btf_str(btf_id.btf, t->name_off));
+    id = t->type;
+    t = btf__type_by_id(btf_id.btf, t->type);
+  }
+
+  return id;
+}
+
 SizedType BTF::get_stype(const BTFId &btf_id, bool resolve_structs)
 {
   const struct btf_type *t = btf__type_by_id(btf_id.btf, btf_id.id);
@@ -375,9 +390,12 @@ SizedType BTF::get_stype(const BTFId &btf_id, bool resolve_structs)
     if (resolve_structs)
       resolve_fields(stype);
   } else if (btf_is_ptr(t)) {
-    // t->type is the pointee type
+    const BTFId pointee_btf_id = { .btf = btf_id.btf, .id = t->type };
+    std::unordered_set<std::string> tags;
+    auto id = get_type_tags(tags, pointee_btf_id);
     stype = CreatePointer(
-        get_stype(BTFId{ .btf = btf_id.btf, .id = t->type }, false));
+        get_stype(BTFId{ .btf = btf_id.btf, .id = id }, false));
+    stype.SetBtfTypeTags(std::move(tags));
   } else if (btf_is_array(t)) {
     auto *array = btf_array(t);
     const auto &elem_type = get_stype(
@@ -549,16 +567,11 @@ std::map<std::string, std::vector<std::string>> BTF::get_params_from_btf(
     if (!t)
       continue;
 
-    _Pragma("GCC diagnostic push")
-        _Pragma("GCC diagnostic ignored \"-Wmissing-field-initializers\"")
+    BPFTRACE_LIBBPF_OPTS(btf_dump_emit_type_decl_opts,
+                         decl_opts,
+                         .field_name = "");
 
-            DECLARE_LIBBPF_OPTS(btf_dump_emit_type_decl_opts,
-                                decl_opts,
-                                .field_name = "");
-
-    _Pragma("GCC diagnostic pop")
-
-        const struct btf_param *p;
+    const struct btf_param *p;
     int j;
 
     for (j = 0, p = btf_params(t); j < btf_vlen(t); j++, p++) {
