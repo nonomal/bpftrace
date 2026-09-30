@@ -1,22 +1,31 @@
 #!/usr/bin/python3
 
 import json
+import math
 import subprocess
 import signal
 import sys
 import os
 import time
-from distutils.version import LooseVersion
+from looseversion import LooseVersion
 import re
 from functools import lru_cache
+import time
 
 import cmake_vars
 
 BPFTRACE_BIN = os.environ["BPFTRACE_RUNTIME_TEST_EXECUTABLE"]
-AOT_BIN = os.environ["BPFTRACE_AOT_RUNTIME_TEST_EXECUTABLE"]
 COLOR_SETTING = os.environ.get("RUNTIME_TEST_COLOR", "auto")
+
+# This attach specific timeout doesn't make much sense - all time should just
+# be accounted towards TIMEOUT directive value.
+#
+# But deleting the attachment specific timeout causes hangs.  And I can't quite
+# figure out why. The next person that reads this is encouraged to try and
+# debug it. But please try running the CI at least 5-10 times before merging.
+# The hang will cause the job to hang indefinitely, so it should be easy to
+# spot.
 ATTACH_TIMEOUT = 10
-DEFAULT_TIMEOUT = 5
 
 
 OK_COLOR = '\033[92m'
@@ -45,6 +54,9 @@ def warn(s):
 def fail(s):
     return colorify(s, ERROR_COLOR)
 
+def to_utf8(s):
+    return s.encode("unicode_escape").decode("utf-8")
+
 class TimeoutError(Exception):
     pass
 
@@ -58,6 +70,7 @@ class Runner(object):
     SKIP_FEATURE_REQUIREMENT_UNSATISFIED = 6
     SKIP_AOT_NOT_SUPPORTED = 7
     SKIP_KERNEL_VERSION_MAX = 8
+    SKIP_NOT_IN_ALLOWLIST = 9
 
     @staticmethod
     def failed(status):
@@ -76,6 +89,7 @@ class Runner(object):
             Runner.SKIP_ENVIRONMENT_DISABLED,
             Runner.SKIP_FEATURE_REQUIREMENT_UNSATISFIED,
             Runner.SKIP_AOT_NOT_SUPPORTED,
+            Runner.SKIP_NOT_IN_ALLOWLIST,
         ]
 
     @staticmethod
@@ -94,6 +108,8 @@ class Runner(object):
             return "disabled by environment variable"
         elif status == Runner.SKIP_AOT_NOT_SUPPORTED:
             return "aot does not yet support this"
+        elif status == Runner.SKIP_NOT_IN_ALLOWLIST:
+            return "disabled by entry not in allowlist file"
         else:
             raise ValueError("Invalid skip reason: %d" % status)
 
@@ -102,17 +118,16 @@ class Runner(object):
         nsenter_prefix = (" ".join(nsenter) + " ") if len(nsenter) > 0 else ""
 
         if test.run:
-            ret = re.sub("{{BPFTRACE}}", BPFTRACE_BIN, test.run)
-            ret = re.sub("{{BPFTRACE_AOTRT}}", AOT_BIN, ret)
+            ret = re.sub("{{BPFTRACE}}", BPFTRACE_BIN + " --verify-llvm-ir", test.run)
 
             return nsenter_prefix + ret
         else:  # PROG
-            use_json = "-q -f json" if test.expects[0].mode == "json" else ""
+            use_json = "-q -f json" if (len(test.expects) > 0 and test.expects[0].mode == "json") else ""
             escaped_prog = test.prog.replace("'", "'\\''")
-            cmd = nsenter_prefix + "{} {} -e '{}'".format(BPFTRACE_BIN, use_json, escaped_prog)
+            cmd = nsenter_prefix + "{} {} --verify-llvm-ir -e '{}'".format(BPFTRACE_BIN, use_json, escaped_prog)
             # We're only reusing PROG-directive tests for AOT tests
             if test.suite == 'aot':
-                return cmd + " --aot /tmp/tmpprog.btaot && {} /tmp/tmpprog.btaot".format(AOT_BIN)
+                return cmd + " --aot /tmp/tmpprog.btaot && /tmp/tmpprog.btaot"
             else:
                 return cmd
 
@@ -122,7 +137,7 @@ class Runner(object):
 
     @staticmethod
     @lru_cache(maxsize=1)
-    def __get_bpffeature():
+    def get_bpffeature():
         p = subprocess.Popen(
             [BPFTRACE_BIN, "--info"],
             stdout=subprocess.PIPE,
@@ -132,24 +147,23 @@ class Runner(object):
         )
         output = p.communicate()[0]
         bpffeature = {}
-        bpffeature["loop"] = output.find("Loop support: yes") != -1
         bpffeature["probe_read_kernel"] = output.find("probe_read_kernel: yes") != -1
         bpffeature["btf"] = output.find("btf: yes") != -1
-        bpffeature["kfunc"] = output.find("kfunc: yes") != -1
+        bpffeature["fentry"] = output.find("fentry: yes") != -1
         bpffeature["dpath"] = output.find("dpath: yes") != -1
-        bpffeature["uprobe_refcount"] = \
-            output.find("uprobe refcount (depends on Build:bcc bpf_attach_uprobe refcount): yes") != -1
         bpffeature["signal"] = output.find("send_signal: yes") != -1
-        bpffeature["iter"] = output.find("iter: yes") != -1
         bpffeature["libpath_resolv"] = output.find("bcc library path resolution: yes") != -1
-        bpffeature["dwarf"] = output.find("liblldb (DWARF support): yes") != -1
+        bpffeature["dwarf"] = output.find("libdw (DWARF support): yes") != -1
         bpffeature["kprobe_multi"] = output.find("kprobe_multi: yes") != -1
+        bpffeature["kprobe_session"] = output.find("kprobe_session: yes") != -1
         bpffeature["uprobe_multi"] = output.find("uprobe_multi: yes") != -1
         bpffeature["aot"] = cmake_vars.LIBBCC_BPF_CONTAINS_RUNTIME
         bpffeature["skboutput"] = output.find("skboutput: yes") != -1
-        bpffeature["get_tai_ns"] = output.find("get_ktime_ns: yes") != -1
+        bpffeature["get_tai_ns"] = output.find("get_tai_ns: yes") != -1
         bpffeature["get_func_ip"] = output.find("get_func_ip: yes") != -1
         bpffeature["jiffies64"] = output.find("jiffies64: yes") != -1
+        bpffeature["dwunwind"] = output.find("dwunwind (DWARF stack unwinding): yes") != -1
+        bpffeature["blazesym"] = output.find("blazesym (advanced symbolization): yes") != -1
         return bpffeature
 
 
@@ -176,6 +190,28 @@ class Runner(object):
 
 
     @staticmethod
+    def __setup_cleanup(test, setup=True):
+        test_ident = f"{test.suite}.{test.name}"
+        if setup:
+            cmd = test.setup
+            name = "SETUP"
+        else:
+            cmd = test.cleanup
+            name = "CLEANUP"
+
+        try:
+            process = subprocess.run(cmd, shell=True, stderr=subprocess.STDOUT,
+                                     stdout=subprocess.PIPE, universal_newlines=True)
+            process.check_returncode()
+        except subprocess.CalledProcessError as e:
+            print(fail(f"[  FAILED  ] {test_ident}"))
+            print(f"\t{name} error: %s" % to_utf8(e.stdout))
+            return Runner.FAIL
+
+        return None
+
+
+    @staticmethod
     def run_test(test):
         current_kernel = LooseVersion(os.uname()[2])
         if test.kernel_min and LooseVersion(test.kernel_min) > current_kernel:
@@ -192,6 +228,7 @@ class Runner(object):
 
         signal.signal(signal.SIGALRM, Runner.__handler)
 
+        start_time = time.time()
         p = None
         befores = []
         befores_output = []
@@ -209,13 +246,18 @@ class Runner(object):
         def get_pid_ns_cmd(cmd):
             return nsenter + [os.path.abspath(x) for x in cmd.split()]
 
+        def localize_timestamps(fmt):
+            if test.localize_ts < 0:
+                return fmt
+            return time.strftime(fmt, time.localtime(test.localize_ts))
+
         def check_expect(expect, output):
             try:
                 if expect.mode == "text":
                     # Raw text match on an entire line, ignoring leading/trailing whitespace
-                    return re.search(f"^\s*{re.escape(expect.expect)}\s*$", output, re.M)
+                    return re.search(f"^\\s*{re.escape(expect.expect)}\\s*$", output, re.M)
                 elif expect.mode == "text_none":
-                    return not re.search(f"^\s*{re.escape(expect.expect)}\s*$", output, re.M)
+                    return not re.search(f"^\\s*{re.escape(expect.expect)}\\s*$", output, re.M)
                 elif expect.mode == "regex":
                     return re.search(expect.expect, output, re.M)
                 elif expect.mode == "regex_none":
@@ -223,7 +265,7 @@ class Runner(object):
                 elif expect.mode == "file":
                     with open(expect.expect) as expect_file:
                         # remove leading and trailing empty lines
-                        return output.strip() == expect_file.read().strip()
+                        return output.strip() == localize_timestamps(expect_file.read().strip())
                 else:
                     with open(expect.expect) as expect_file:
                         _, file_extension = os.path.splitext(expect.expect)
@@ -282,7 +324,7 @@ class Runner(object):
                             return Runner.SKIP_REQUIREMENT_UNSATISFIED
 
             if test.feature_requirement or test.neg_feature_requirement:
-                bpffeature = Runner.__get_bpffeature()
+                bpffeature = Runner.get_bpffeature()
 
                 for feature in test.feature_requirement:
                     if feature not in bpffeature:
@@ -300,6 +342,11 @@ class Runner(object):
 
             if test.new_pidns and not test.befores:
                 raise ValueError("`NEW_PIDNS` requires at least one `BEFORE` directive as something needs to run in the new pid namespace")
+
+            if test.setup:
+                setup = Runner.__setup_cleanup(test, setup=True)
+                if setup:
+                    return setup
 
             if test.befores:
                 if test.new_pidns:
@@ -352,8 +399,6 @@ class Runner(object):
                 if test.new_pidns:
                     # This can be fixed in the future if needed
                     raise ValueError(f"BEFORE_PID cannot be used with NEW_PIDNS")
-                if len(test.befores) > 1:
-                    raise ValueError(f"test has {len(test.befores)} BEFORE clauses but BEFORE_PID usage requires exactly one")
 
                 child_name = test.befores[0].strip().split()[-1]
                 child_name = os.path.basename(child_name)
@@ -364,7 +409,6 @@ class Runner(object):
                 'test': test.name,
                 '__BPFTRACE_NOTIFY_PROBES_ATTACHED': '1',
                 '__BPFTRACE_NOTIFY_AOT_PORTABILITY_DISABLED': '1',
-                'BPFTRACE_VERIFY_LLVM_IR': '1',
                 'PATH': os.environ.get('PATH', ''),
             }
             env.update(test.env)
@@ -373,6 +417,7 @@ class Runner(object):
                 shell=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
+                errors='backslashreplace',
                 env=env,
                 start_new_session=True,
                 universal_newlines=True,
@@ -389,7 +434,7 @@ class Runner(object):
                     attached = True
                     if test.has_exact_expect:
                         output = ""  # ignore earlier ouput
-                    signal.alarm(test.timeout or DEFAULT_TIMEOUT)
+                    signal.alarm(test.timeout)
                     if test.after:
                         after_cmd = get_pid_ns_cmd(test.after) if test.new_pidns else test.after
                         after = subprocess.Popen(after_cmd, shell=True,
@@ -418,7 +463,16 @@ class Runner(object):
             if p:
                 if p.poll() is None:
                     os.killpg(os.getpgid(p.pid), signal.SIGTERM)
-                output += p.stdout.read()
+                try:
+                    # SIGTERM only sets the exit flag in bpftrace event loop.
+                    # If bpftrace is stuck somewhere else, it won't exit. So we
+                    # have to set a timeout here to prevent hangs.
+                    output += p.communicate(timeout=1)[0]
+                except subprocess.TimeoutExpired:
+                    # subprocess.communicate() docs say communicate() is only
+                    # reliable after a TimeoutExpired if you kill and retry.
+                    os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+                    output += p.communicate()[0]
                 result = check_result(output)
 
                 if not result:
@@ -433,10 +487,10 @@ class Runner(object):
                     try:
                         befores_output.append(before.communicate(timeout=1)[0])
                     except subprocess.TimeoutExpired:
-                        pass # if timed out getting output, there is effectively no output
-                    if before.poll() is None:
                         os.killpg(os.getpgid(before.pid), signal.SIGKILL)
+                        befores_output.append(before.communicate()[0])
 
+            # Cleanup just in case
             if bpftrace and bpftrace.poll() is None:
                 os.killpg(os.getpgid(p.pid), signal.SIGKILL)
 
@@ -444,48 +498,52 @@ class Runner(object):
                 try:
                     after_output = after.communicate(timeout=1)[0]
                 except subprocess.TimeoutExpired:
-                        pass # if timed out getting output, there is effectively no output
-                if after.poll() is None:
                     os.killpg(os.getpgid(after.pid), signal.SIGKILL)
-
-        if test.cleanup:
-            try:
-                cleanup = subprocess.run(test.cleanup, shell=True, stderr=subprocess.PIPE,
-                                         stdout=subprocess.PIPE, universal_newlines=True)
-                cleanup.check_returncode()
-            except subprocess.CalledProcessError as e:
-                print(fail("[  FAILED  ] ") + "%s.%s" % (test.suite, test.name))
-                print('\tCLEANUP error: %s' % e.stderr)
-                return Runner.FAIL
-
-        def to_utf8(s):
-            return s.encode("unicode_escape").decode("utf-8")
+                    after_output = after.communicate()[0]
 
         def print_befores_and_after_output():
             if len(befores_output) > 0:
                 for out in befores_output:
-                    out = out.encode("unicode_escape").decode("utf-8")
-                    print(f"\tBefore cmd output: {out}")
+                    print(f"\tBefore cmd output: {to_utf8(out)}")
             if after_output is not None:
-                out = after_output.encode("unicode_escape").decode("utf-8")
-                print(f"\tAfter cmd output: {out}")
+                print(f"\tAfter cmd output: {to_utf8(after_output)}")
 
-        if p and p.returncode != 0 and not test.will_fail and not timeout:
-            print(fail("[  FAILED  ] ") + "%s.%s" % (test.suite, test.name))
-            print('\tCommand: ' + bpf_call)
-            print('\tUnclean exit code: ' + str(p.returncode))
-            print('\tOutput: ' + output.encode("unicode_escape").decode("utf-8"))
-            print_befores_and_after_output()
-            return Runner.FAIL
+        if test.cleanup:
+                cleanup = Runner.__setup_cleanup(test, setup=False)
+                if cleanup:
+                    print('\tOutput: ' + to_utf8(output))
+                    print_befores_and_after_output()
+                    return cleanup
+
+        elapsed = math.ceil((time.time() - start_time) * 1000)
+        label = f"{test.suite}.{test.name} ({elapsed} ms)"
+
+        if '__BPFTRACE_NOTIFY_AOT_PORTABILITY_DISABLED' in to_utf8(output):
+            print(warn("[   SKIP   ] ") + label)
+            return Runner.SKIP_AOT_NOT_SUPPORTED
+
+        if p and not timeout:
+            if p.returncode != test.return_code and not test.will_fail:
+                print(fail("[  FAILED  ] ") + label)
+                print('\tCommand: ' + bpf_call)
+                print('\tUnclean exit code: ' + str(p.returncode))
+                print('\tOutput: ' + to_utf8(output))
+                print_befores_and_after_output()
+                return Runner.FAIL
+
+            if p.returncode == 0 and test.will_fail:
+                print(fail("[  FAILED  ] ") + label)
+                print("\tCommand: " + bpf_call)
+                print("\tClean exit code but expecting failure with WILL_FAIL directive")
+                print("\tOutput: " + to_utf8(output))
+                print_befores_and_after_output()
+                return Runner.FAIL
 
         if result:
-            print(ok("[       OK ] ") + "%s.%s" % (test.suite, test.name))
+            print(ok("[       OK ] ") + label)
             return Runner.PASS
-        elif '__BPFTRACE_NOTIFY_AOT_PORTABILITY_DISABLED' in output:
-            print(warn("[   SKIP   ] ") + "%s.%s" % (test.suite, test.name))
-            return Runner.SKIP_AOT_NOT_SUPPORTED
         else:
-            print(fail("[  FAILED  ] ") + "%s.%s" % (test.suite, test.name))
+            print(fail("[  FAILED  ] ") + label)
             print('\tCommand: ' + bpf_call)
             for failed_expect in failed_expects:
                 if failed_expect.mode == "text":

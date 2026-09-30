@@ -17,12 +17,11 @@ IFS=',' read -ra SKIP_TOOLS <<< "${TOOLS_TEST_DISABLE:-"NONE"}"
 
 function set_tooldir() {
   local dir
-  for dir in "${DIR}/../../tools"; do
-      if [[ -d "$dir" ]]; then
-          TOOLDIR="$dir"
-          return
-      fi
-  done
+  dir=$(realpath "${DIR}/../../tools")
+  if [[ -d "$dir" ]]; then
+      TOOLDIR="$dir"
+      return
+  fi
 
   >&2 echo "Tool dir not found"
   exit 1
@@ -30,11 +29,17 @@ function set_tooldir() {
 
 function do_test() {
   local file="$1"
-  if $BPFTRACE_EXECUTABLE --unsafe -d "$file" 2>/dev/null >/dev/null; then
+  local probes
+  if ! probes="$($BPFTRACE_EXECUTABLE -l "$file")"; then
+    echo "$file    failed, unable to list probes";
+  fi
+  if [[ -z "$probes" ]]; then
+    echo "$file    skipped";
+  elif $BPFTRACE_EXECUTABLE --unsafe -v --dry-run "$file" 2>/dev/null >/dev/null; then
     echo "$file    passed"
   else
     echo "$file    failed";
-    $BPFTRACE_EXECUTABLE --unsafe -d "$file";
+    $BPFTRACE_EXECUTABLE --unsafe -v --dry-run "$file";
     EXIT_STATUS=1;
   fi
 }

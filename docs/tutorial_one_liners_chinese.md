@@ -20,7 +20,7 @@ bpftrace -l 'tracepoint:syscalls:sys_enter_*'
 
 ```
 # bpftrace -e 'BEGIN { printf("hello world\n"); }'
-Attaching 1 probe...
+Attached 1 probe
 hello world
 ^C
 ```
@@ -34,7 +34,7 @@ hello world
 
 ```
 # bpftrace -e 'tracepoint:syscalls:sys_enter_openat { printf("%s %s\n", comm, str(args.filename)); }'
-Attaching 1 probe...
+Attached 1 probe
 snmp-pass /proc/cpuinfo
 snmp-pass /proc/stat
 snmpd /proc/net/dev
@@ -54,7 +54,7 @@ snmpd /proc/net/if_inet6
 
 ```
 bpftrace -e 'tracepoint:raw_syscalls:sys_enter { @[comm] = count(); }'
-Attaching 1 probe...
+Attached 1 probe
 ^C
 
 @[bpftrace]: 6
@@ -75,7 +75,7 @@ Maps会在bpftrace结束(如按Ctrl-C)时自动打印出来。
 
 ```
 # bpftrace -e 'tracepoint:syscalls:sys_exit_read /pid == 18644/ { @bytes = hist(args.ret); }'
-Attaching 1 probe...
+Attached 1 probe
 ^C
 
 @bytes:
@@ -100,7 +100,7 @@ Attaching 1 probe...
 
 ```
 # bpftrace -e 'kretprobe:vfs_read { @bytes = lhist(retval, 0, 2000, 200); }'
-Attaching 1 probe...
+Attached 1 probe
 ^C
 
 @bytes:
@@ -126,8 +126,8 @@ Attaching 1 probe...
 # 7. read()调用的时间
 
 ```
-# bpftrace -e 'kprobe:vfs_read { @start[tid] = nsecs; } kretprobe:vfs_read /@start[tid]/ { @ns[comm] = hist(nsecs - @start[tid]); delete(@start[tid]); }'
-Attaching 2 probes...
+# bpftrace -e 'kprobe:vfs_read { @start[tid] = nsecs; } kretprobe:vfs_read /@start[tid]/ { @ns[comm] = hist(nsecs - @start[tid]); delete(@start, tid); }'
+Attached 2 probes
 
 [...]
 @ns[snmp-pass]:
@@ -159,13 +159,13 @@ Attaching 2 probes...
 - @start[tid]: 使用线程ID作为key。某一时刻，可能有许许多多的read调用正在进行，我们希望为每个调用记录一个起始时间戳。这要如何做到呢？我们可以为每个read调用建立一个唯一的标识符，并用它作为key进行统计。由于内核线程一次只能执行一个系统调用，我们可以使用线程ID作为上述标识符。
 - nsecs: 自系统启动到现在的纳秒数。这是一个高精度时间戳，可以用来对事件计时。
 - /@start[tid]/: 该过滤条件检查起始时间戳是否被记录。程序可能在某次read调用中途被启动，如果没有这个过滤条件，这个调用的时间会被统计为now-zero，而不是now-start。
-- delete(@start[tid]): 释放变量。
+- delete(@start, tid): 释放变量。
 
 # 8. 统计进程级别的事件
 
 ```
 # bpftrace -e 'tracepoint:sched:sched* { @[probe] = count(); } interval:s:5 { exit(); }'
-Attaching 25 probes...
+Attached 25 probes
 @[tracepoint:sched:sched_wakeup_new]: 1
 @[tracepoint:sched:sched_process_fork]: 1
 @[tracepoint:sched:sched_process_exec]: 1
@@ -190,7 +190,7 @@ Attaching 25 probes...
 
 ```
 # bpftrace -e 'profile:hz:99 { @[kstack] = count(); }'
-Attaching 1 probe...
+Attached 1 probe
 ^C
 
 [...]
@@ -254,7 +254,7 @@ secondary_startup_64+165
 
 ```
 # bpftrace -e 'tracepoint:block:block_rq_issue { @ = hist(args.bytes); }'
-Attaching 1 probe...
+Attached 1 probe
 ^C
 
 @:
@@ -302,7 +302,7 @@ kprobe:vfs_open
 }
 
 # bpftrace path.bt
-Attaching 1 probe...
+Attached 1 probe
 open path: dev
 open path: if_inet6
 open path: retrans_time_ms

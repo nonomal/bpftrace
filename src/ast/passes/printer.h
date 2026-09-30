@@ -1,61 +1,187 @@
 #pragma once
 
+#include <memory>
 #include <ostream>
 
-#include "ast/visitors.h"
+#include "ast/visitor.h"
 
-namespace bpftrace {
-namespace ast {
+namespace bpftrace::ast {
 
-class Printer : public Visitor {
+class TypeMap;
+
+// BufferState is an internal type.
+struct BufferState;
+
+// Buffer is an internal type for output construction.
+class Buffer {
 public:
-  explicit Printer(std::ostream &out) : out_(out)
-  {
-  }
+  Buffer();
+  ~Buffer();
+  Buffer(Buffer &&) = default;
+  Buffer &operator=(Buffer &&) = default;
+  Buffer(const Buffer &) = delete;
+  Buffer &operator=(const Buffer &) = delete;
 
-  void print(Node *root);
+  [[nodiscard]] Buffer &&append(Buffer &&other,
+                                size_t indent = 0,
+                                bool align = true);
+  [[nodiscard]] Buffer &&text(std::string str);
+  [[nodiscard]] Buffer &&metadata(
+      MetadataIndex metadata,
+      std::optional<size_t> min_vspace = std::nullopt);
+  [[nodiscard]] Buffer &&comment(std::string str);
+  [[nodiscard]] Buffer &&line_break();
 
-  void visit(Integer &integer) override;
-  void visit(PositionalParameter &param) override;
-  void visit(String &string) override;
-  void visit(StackMode &mode) override;
-  void visit(Identifier &identifier) override;
-  void visit(Builtin &builtin) override;
-  void visit(Call &call) override;
-  void visit(Sizeof &szof) override;
-  void visit(Offsetof &ofof) override;
-  void visit(Map &map) override;
-  void visit(Variable &var) override;
-  void visit(Binop &binop) override;
-  void visit(Unop &unop) override;
-  void visit(Ternary &ternary) override;
-  void visit(FieldAccess &acc) override;
-  void visit(ArrayAccess &arr) override;
-  void visit(Cast &cast) override;
-  void visit(Tuple &tuple) override;
-  void visit(ExprStatement &expr) override;
-  void visit(AssignMapStatement &assignment) override;
-  void visit(AssignVarStatement &assignment) override;
-  void visit(AssignConfigVarStatement &assignment) override;
-  void visit(If &if_block) override;
-  void visit(Unroll &unroll) override;
-  void visit(While &while_block) override;
-  void visit(For &for_loop) override;
-  void visit(Config &config) override;
-  void visit(Jump &jump) override;
-  void visit(Predicate &pred) override;
-  void visit(AttachPoint &ap) override;
-  void visit(Probe &probe) override;
-  void visit(Subprog &subprog) override;
-  void visit(Program &program) override;
-
-  int depth_ = -1;
+  size_t width() const;
+  size_t lines() const;
 
 private:
-  std::ostream &out_;
-
-  std::string type(const SizedType &ty);
+  std::unique_ptr<BufferState> state;
+  friend std::ostream &operator<<(std::ostream &out, const Buffer &buffer);
 };
 
-} // namespace ast
-} // namespace bpftrace
+// Buffer is directly printable, used below.
+std::ostream &operator<<(std::ostream &out, const Buffer &buffer);
+
+// Control how types should be formatted.
+enum FormatMode {
+  Minimal, // Only probes, no comments or spacing.
+  Full,    // Print with full comments and spacing.
+  Debug,   // Print with no comments, spacing but full types.
+};
+
+// Generic class for printing AST nodes.
+class Formatter : public Visitor<Formatter, Buffer> {
+public:
+  Formatter(FormatMode mode,
+            MetadataIndex &metadata,
+            size_t max_width,
+            bool bare = false,
+            const TypeMap *type_map = nullptr)
+      : mode(mode),
+        metadata(metadata),
+        max_width(max_width),
+        bare(bare),
+        type_map(type_map) {};
+
+  using Visitor<Formatter, Buffer>::visit;
+  Buffer visit(Integer &integer);
+  Buffer visit(NegativeInteger &integer);
+  Buffer visit(Boolean &boolean);
+  Buffer visit(PositionalParameter &param);
+  Buffer visit(PositionalParameterCount &param);
+  Buffer visit(String &string);
+  Buffer visit(None &none);
+  Buffer visit(Builtin &builtin);
+  Buffer visit(Identifier &identifier);
+  Buffer visit(ParsedType &type);
+  Buffer visit(Variable &var);
+  Buffer visit(VariableAddr &var_addr);
+  Buffer visit(SubprogArg &subprog_arg);
+  Buffer visit(AttachPoint &ap);
+  Buffer visit(Call &call);
+  Buffer visit(Sizeof &szof);
+  Buffer visit(Offsetof &ofof);
+  Buffer visit(TypeArg &type_arg);
+  Buffer visit(Typeof &typeof);
+  Buffer visit(Typeinfo &typeinfo);
+  Buffer visit(Comptime &comptime);
+  Buffer visit(MapDeclStatement &decl);
+  Buffer visit(Map &map);
+  Buffer visit(MapAddr &map_addr);
+  Buffer visit(Binop &binop);
+  Buffer visit(Unop &unop);
+  Buffer visit(IfExpr &if_expr);
+  Buffer visit(FieldAccess &acc);
+  Buffer visit(ArrayAccess &arr);
+  Buffer visit(TupleAccess &acc);
+  Buffer visit(MapAccess &acc);
+  Buffer visit(Cast &cast);
+  Buffer visit(Tuple &tuple);
+  Buffer visit(Record &record);
+  Buffer visit(ExprStatement &expr);
+  Buffer visit(AssignScalarMapStatement &assignment);
+  Buffer visit(AssignMapStatement &assignment);
+  Buffer visit(AssignVarStatement &assignment);
+  Buffer visit(AssignConfigVarStatement &assignment);
+  Buffer visit(VarDeclStatement &decl);
+  Buffer visit(Jump &jump);
+  Buffer visit(Unroll &unroll);
+  Buffer visit(DiscardExpr &discard);
+  Buffer visit(While &while_block);
+  Buffer visit(Range &range);
+  Buffer visit(For &for_loop);
+  Buffer visit(Probe &probe);
+  Buffer visit(Config &config);
+  Buffer visit(BlockExpr &block);
+  Buffer visit(Macro &macro);
+  Buffer visit(Subprog &subprog);
+  Buffer visit(RootImport &imp);
+  Buffer visit(StatementImport &imp);
+  Buffer visit(Program &program);
+  Buffer visit(Expression &expr);
+  Buffer visit(Statement &stmt);
+  Buffer visit(RootStatement &root);
+  Buffer visit(CStatement &cstmt);
+  Buffer visit(NamedArgument &named_arg);
+  Buffer visit(const ParsedType &type);
+
+private:
+  template <typename U>
+  Buffer format(U &value,
+                MetadataIndex &metadata,
+                size_t max_width,
+                bool bare = false)
+  {
+    return Formatter(mode, metadata, max_width, bare, type_map).visit(value);
+  }
+
+  Buffer format_expr_as_type(Expression &expr, size_t max_width);
+  Buffer format_type_arg(ExprOrType &record, size_t max_width);
+
+  template <typename U>
+  Buffer format_list(std::vector<U> &exprs,
+                     const std::string &sep,
+                     MetadataIndex &metadata,
+                     size_t max_width,
+                     bool bare = false);
+
+  FormatMode mode;
+  MetadataIndex &metadata;
+  size_t max_width;
+  bool bare;
+  const TypeMap *type_map;
+};
+
+// Printer is a class to format AST nodes of type T.
+class Printer : Visitor<Printer> {
+public:
+  constexpr static size_t kDefaultWidth = 90;
+  Printer(const ASTContext &ast,
+          std::ostream &out,
+          FormatMode mode = FormatMode::Minimal,
+          size_t max_width = kDefaultWidth,
+          const TypeMap *type_map = nullptr)
+      : ast_(ast),
+        out_(out),
+        mode_(mode),
+        max_width_(max_width),
+        type_map_(type_map) {};
+
+  template <typename T>
+  void visit(T &value)
+  {
+    MetadataIndex metadata = ast_.metadata();
+    out_
+        << Formatter(mode_, metadata, max_width_, true, type_map_).visit(value);
+  }
+
+private:
+  const ASTContext &ast_;
+  std::ostream &out_;
+  FormatMode mode_;
+  size_t max_width_;
+  const TypeMap *type_map_;
+};
+
+} // namespace bpftrace::ast

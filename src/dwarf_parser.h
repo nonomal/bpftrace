@@ -2,15 +2,38 @@
 
 #include "struct.h"
 #include "types.h"
+#include "util/result.h"
 
+#include <filesystem>
 #include <memory>
-#include <optional>
 #include <string>
 #include <vector>
 
-#ifdef HAVE_LIBLLDB
-#include <lldb/API/SBDebugger.h>
-#include <lldb/API/SBTarget.h>
+namespace bpftrace {
+
+class DwarfParseError : public ErrorInfo<DwarfParseError> {
+public:
+  static char ID;
+  void log(llvm::raw_ostream &OS) const override;
+
+  DwarfParseError(std::string &&msg) : msg_(std::move(msg)) {};
+  DwarfParseError() = default;
+
+  const std::string &msg() const
+  {
+    return msg_;
+  }
+
+private:
+  std::string msg_;
+};
+
+} // namespace bpftrace
+
+#ifdef HAVE_LIBDW
+#include <elfutils/libdwfl.h>
+#include <optional>
+#include <unordered_map>
 
 namespace bpftrace {
 
@@ -20,90 +43,184 @@ class Dwarf {
 public:
   virtual ~Dwarf();
 
-  static std::unique_ptr<Dwarf> GetFromBinary(BPFtrace *bpftrace,
-                                              std::string file_path);
+  Dwarf(const Dwarf &) = delete;
+  Dwarf &operator=(const Dwarf &) = delete;
 
-  std::vector<uint64_t> get_function_locations(const std::string &function,
-                                               bool include_inlined);
-  std::vector<std::string> get_function_params(const std::string &function);
-  Struct resolve_args(const std::string &function);
+  Dwarf(Dwarf &&) = delete;
+  Dwarf &operator=(Dwarf &&) = delete;
 
-  SizedType get_stype(const std::string &type_name);
-  void resolve_fields(const SizedType &type);
+  static std::unique_ptr<Dwarf> GetFromBinary(
+      BPFtrace *bpftrace,
+      const std::string &file_path,
+      const std::string &debuginfo_path);
+
+  static std::unique_ptr<Dwarf> GetFromKernel(
+      BPFtrace *bpftrace,
+      const std::string &debuginfo_path);
+
+  std::vector<std::string> get_function_params(
+      const std::string &function) const;
+  std::shared_ptr<Struct> resolve_args(const std::string &function);
+
+  SizedType get_stype(const std::string &type_name) const;
+  void resolve_fields(const SizedType &type) const;
+
+  struct SourceLocation {
+    uint64_t address;
+    std::string kernel_module;
+  };
+
+  Result<SourceLocation> line_to_addr(const std::string &source_file,
+                                      size_t line_num,
+                                      size_t col_num = 0) const;
 
 private:
-  static std::atomic<size_t> instance_count;
+  // Compilation unit wrapper, abstracting over regular and split (DWO/DWP)
+  // CU DIEs.
+  class CuInfo {
+  public:
+    // Standard CU DIE, managed by the libdw session.
+    Dwarf_Die *cudie = nullptr;
 
-  Dwarf(BPFtrace *bpftrace, std::string file_path);
+    // Split CU DIE loaded from a dwo/dwp file. Must be owned and managed
+    // manually per the libdw API, and is valid for the lifetime of the CuInfo
+    // instance.
+    //
+    // Present when cudie is a DW_UT_skeleton unit. In that case, this should
+    // be used instead, as it holds vast majority of the debug info. libdw
+    // automatically resolves references between the skeleton and split CU.
+    std::optional<Dwarf_Die> split_cudie;
 
-  lldb::SBValueList function_params(const std::string &function);
+    Dwarf_Addr mod_bias = 0;
 
-  std::string get_type_name(lldb::SBType type);
-  SizedType get_stype(lldb::SBType type, bool resolve_structs = true);
-  std::optional<Bitfield> resolve_bitfield(lldb::SBTypeMember field);
+    // Returns split CU DIE if present (skeleton CU), otherwise cudie.
+    Dwarf_Die *cu_die()
+    {
+      return split_cudie ? &split_cudie.value() : cudie;
+    }
+
+    // CU source file (filled when searching CU by source file)
+    std::optional<std::filesystem::path> source_path;
+  };
+
+  // The DWFL setup is shared by offline binaries and the running kernel.
+  // Kernel mode reports the kernel and loaded modules instead of an offline
+  // file and applies the module load bias to addresses.
+  Dwarf(BPFtrace *bpftrace,
+        std::string file_path,
+        std::string debuginfo_path,
+        bool is_kernel);
+
+  bool next_cu_info(CuInfo *cu_info) const;
+  std::vector<Dwarf_Die> function_param_dies(const std::string &function) const;
+  std::optional<Dwarf_Die> get_func_die(const std::string &function) const;
+  std::string get_type_name(Dwarf_Die &type_die) const;
+  Dwarf_Word get_type_encoding(Dwarf_Die &type_die) const;
+  std::optional<Dwarf_Die> find_type(const std::string &name) const;
+  static ssize_t get_array_size(Dwarf_Die &subrange_die);
+  static ssize_t get_field_byte_offset(Dwarf_Die &field_die);
+  static ssize_t get_field_bit_offset(Dwarf_Die &field_die);
+  static ssize_t get_bitfield_size(Dwarf_Die &field_die);
+  std::optional<Bitfield> resolve_bitfield(Dwarf_Die &field_die) const;
+
+  SizedType get_stype(Dwarf_Die &type_die, bool resolve_structs = true) const;
+
+  Result<CuInfo> get_cu_by_src(const std::string &source_file) const;
+
+  static std::optional<Dwarf_Die> get_child_with_tagname(
+      Dwarf_Die *die,
+      int tag,
+      const std::string &name);
+  static std::vector<Dwarf_Die> get_all_children_with_tag(Dwarf_Die *die,
+                                                          int tag);
+
+  static std::vector<std::filesystem::path> get_cu_src_paths(Dwarf_Die *cudie);
+
+  Dwfl *dwfl = nullptr;
+  Dwfl_Callbacks callbacks = {};
 
   BPFtrace *bpftrace_;
   std::string file_path_;
-
-  lldb::SBDebugger debugger_;
-  lldb::SBTarget target_;
+  // Dwfl_Callbacks struct takes a char** pointing to a debuginfo path which has
+  // to remain valid for the lifetime of the dwfl session, because debug info is
+  // loaded lazily; e.g. dwfl_nextcu triggers the find_debuginfo callback on
+  // first use for *each* module and dereferences the pointer.
+  //
+  // Each instance of this class owns a copy of the path string and keeps
+  // debuginfo_path_cstr_ pointing to its internal buffer to pass a stable
+  // char** to Dwfl_Callbacks.
+  std::string debuginfo_path_;
+  const char *debuginfo_path_cstr_;
+  bool is_kernel_ = false;
 };
 
 } // namespace bpftrace
 
-#else // HAVE_LIBLLDB
+#else // HAVE_LIBDW
 
 #include "log.h"
 
 namespace bpftrace {
+
 class BPFtrace;
 
 class Dwarf {
 public:
   static std::unique_ptr<Dwarf> GetFromBinary(BPFtrace *bpftrace
                                               __attribute__((unused)),
-                                              std::string file_path_
+                                              const std::string &file_path_
+                                              __attribute__((unused)),
+                                              const std::string &debuginfo_path
                                               __attribute__((unused)))
   {
-    static bool warned = false;
-    if (!warned)
-      LOG(WARNING) << "Cannot parse DWARF: liblldb not available";
-    warned = true;
     return nullptr;
   }
 
-  std::vector<uint64_t> get_function_locations(const std::string &function
-                                               __attribute__((unused)),
-                                               bool include_inlined
-                                               __attribute__((unused)))
+  static std::unique_ptr<Dwarf> GetFromKernel(BPFtrace *bpftrace
+                                              __attribute__((unused)),
+                                              const std::string &debuginfo_path
+                                              __attribute__((unused)))
   {
-    return {};
+    return nullptr;
   }
 
   std::vector<std::string> get_function_params(const std::string &function
-                                               __attribute__((unused)))
+                                               __attribute__((unused))) const
   {
     return {};
   }
 
-  Struct resolve_args(const std::string &function __attribute__((unused)))
+  std::shared_ptr<Struct> resolve_args(const std::string &function
+                                       __attribute__((unused)))
   {
-    return {};
+    return nullptr;
   }
 
-  SizedType get_stype(const std::string &type_name __attribute__((unused)))
+  SizedType get_stype(const std::string &type_name
+                      __attribute__((unused))) const
   {
     return CreateNone();
   }
 
-  void resolve_fields(const SizedType &type __attribute__((unused)))
+  void resolve_fields(const SizedType &type __attribute__((unused))) const
   {
   }
 
-private:
-  Dwarf() = delete;
+  struct SourceLocation {
+    uint64_t address;
+    std::string kernel_module;
+  };
+
+  Result<SourceLocation> line_to_addr(const std::string &source_file
+                                      __attribute__((unused)),
+                                      size_t line_num __attribute__((unused)),
+                                      size_t col_num
+                                      __attribute__((unused))) const
+  {
+    return make_error<DwarfParseError>();
+  }
 };
 
 } // namespace bpftrace
 
-#endif // HAVE_LIBLLDB
+#endif // HAVE_LIBDW

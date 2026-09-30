@@ -1,10 +1,11 @@
-#include "struct.h"
-
+#include <algorithm>
 #include <iomanip>
 #include <limits>
 
 #include "log.h"
-#include "utils.h"
+#include "struct.h"
+#include "types.h"
+#include "util/exceptions.h"
 
 namespace bpftrace {
 
@@ -57,25 +58,32 @@ bool Bitfield::operator!=(const Bitfield &other) const
   return !(*this == other);
 }
 
-std::unique_ptr<Struct> Struct::CreateTuple(std::vector<SizedType> fields)
+// Creates a struct or tuple with the given field types.
+// If field_names is empty then all fields with be created without names.
+std::shared_ptr<Struct> Struct::CreateRecord(
+    const std::vector<SizedType> &fields,
+    const std::vector<std::string_view> &field_names)
 {
+  assert(field_names.empty() || field_names.size() == fields.size());
+
   // See llvm::StructLayout::StructLayout source
-  std::unique_ptr<Struct> tuple(new Struct(0));
+  auto record = std::make_shared<Struct>(0);
   ssize_t offset = 0;
   ssize_t struct_align = 1;
 
-  for (auto &field : fields) {
+  for (size_t i = 0; i < fields.size(); i++) {
+    const auto &field = fields[i];
     auto align = field.GetInTupleAlignment();
     struct_align = std::max(align, struct_align);
     auto size = field.GetSize();
 
     auto padding = (align - (offset % align)) % align;
     if (padding)
-      tuple->padded = true;
+      record->padded = true;
     offset += padding;
 
-    tuple->fields.push_back(Field{
-        .name = "",
+    record->fields.push_back(Field{
+        .name = field_names.empty() ? "" : std::string{ field_names[i] },
         .type = field,
         .offset = offset,
         .bitfield = std::nullopt,
@@ -86,10 +94,16 @@ std::unique_ptr<Struct> Struct::CreateTuple(std::vector<SizedType> fields)
 
   auto padding = (struct_align - (offset % struct_align)) % struct_align;
 
-  tuple->size = offset + padding;
-  tuple->align = struct_align;
+  record->size = offset + padding;
+  record->align = struct_align;
 
-  return tuple;
+  return record;
+}
+
+std::shared_ptr<Struct> Struct::CreateTuple(
+    const std::vector<SizedType> &fields)
+{
+  return CreateRecord(fields, {});
 }
 
 void Struct::Dump(std::ostream &os)
@@ -119,34 +133,39 @@ void Struct::Dump(std::ostream &os)
 
 bool Struct::HasField(const std::string &name) const
 {
-  for (auto &field : fields) {
-    if (field.name == name)
-      return true;
-  }
-  return false;
+  return std::ranges::any_of(fields, [name](const auto &field) {
+    return field.name == name;
+  });
 }
 
 const Field &Struct::GetField(const std::string &name) const
 {
-  for (auto &field : fields) {
+  for (const auto &field : fields) {
     if (field.name == name)
       return field;
   }
-  throw FatalUserException("struct has no field named " + name);
+  throw util::FatalUserException("struct has no field named " + name);
+}
+
+size_t Struct::GetFieldIdx(const std::string &name) const
+{
+  for (size_t i = 0; i < fields.size(); ++i) {
+    if (fields.at(i).name == name)
+      return i;
+  }
+  throw util::FatalUserException("struct has no field named " + name);
 }
 
 void Struct::AddField(const std::string &field_name,
                       const SizedType &type,
                       ssize_t offset,
-                      const std::optional<Bitfield> &bitfield,
-                      bool is_data_loc)
+                      const std::optional<Bitfield> &bitfield)
 {
   if (!HasField(field_name))
-    fields.emplace_back(Field{ .name = field_name,
-                               .type = type,
-                               .offset = offset,
-                               .bitfield = bitfield,
-                               .is_data_loc = is_data_loc });
+    fields.push_back(Field{ .name = field_name,
+                            .type = type,
+                            .offset = offset,
+                            .bitfield = bitfield });
 }
 
 bool Struct::HasFields() const
@@ -159,25 +178,28 @@ void Struct::ClearFields()
   fields.clear();
 }
 
-void StructManager::Add(const std::string &name,
-                        size_t size,
-                        bool allow_override)
+std::weak_ptr<Struct> StructManager::Add(const std::string &name,
+                                         size_t size,
+                                         bool allow_override)
 {
-  if (struct_map_.find(name) != struct_map_.end())
-    throw FatalUserException("Type redefinition: type with name \'" + name +
-                             "\' already exists");
-  struct_map_[name] = std::make_unique<Struct>(size, allow_override);
+  auto [it, inserted] = struct_map_.insert(
+      { name, std::make_shared<Struct>(size, allow_override) });
+  if (!inserted)
+    throw util::FatalUserException("Type redefinition: type with name \'" +
+                                   name + "\' already exists");
+  return it->second;
 }
 
-void StructManager::Add(const std::string &name, Struct &&record)
+void StructManager::Add(const std::string &name,
+                        std::shared_ptr<Struct> &&record)
 {
-  struct_map_[name] = std::make_shared<Struct>(std::move(record));
+  struct_map_[name] = std::move(record);
 }
 
 std::weak_ptr<Struct> StructManager::Lookup(const std::string &name) const
 {
   auto s = struct_map_.find(name);
-  return s != struct_map_.end() ? s->second : std::weak_ptr<Struct>();
+  return s != struct_map_.end() ? s->second : nullptr;
 }
 
 std::weak_ptr<Struct> StructManager::LookupOrAdd(const std::string &name,
@@ -185,30 +207,23 @@ std::weak_ptr<Struct> StructManager::LookupOrAdd(const std::string &name,
                                                  bool allow_override)
 {
   auto s = struct_map_.insert(
-      { name, std::make_unique<Struct>(size, allow_override) });
+      { name, std::make_shared<Struct>(size, allow_override) });
   return s.first->second;
 }
 
 bool StructManager::Has(const std::string &name) const
 {
-  return struct_map_.find(name) != struct_map_.end();
-}
-
-std::weak_ptr<Struct> StructManager::AddTuple(std::vector<SizedType> fields)
-{
-  auto t = tuples_.insert(Struct::CreateTuple(std::move(fields)));
-  return *t.first;
-}
-
-size_t StructManager::GetTuplesCnt() const
-{
-  return tuples_.size();
+  return struct_map_.contains(name);
 }
 
 const Field *StructManager::GetProbeArg(const ast::Probe &probe,
                                         const std::string &arg_name)
 {
-  auto args = Lookup(probe.args_typename()).lock();
+  auto type_name = probe.args_typename();
+  if (!type_name) {
+    return nullptr; // Ambiguous.
+  }
+  auto args = Lookup(*type_name).lock();
   if (!args || !args->HasField(arg_name))
     return nullptr;
 

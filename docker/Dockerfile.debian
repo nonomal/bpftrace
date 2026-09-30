@@ -7,6 +7,7 @@ FROM debian:sid
 ARG DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y \
     asciidoctor \
+    bpftool \
     binutils-dev \
     bison \
     build-essential \
@@ -16,18 +17,25 @@ RUN apt-get update && apt-get install -y \
     libbpf-dev \
     libbpfcc-dev \
     libcereal-dev \
+    libdw-dev \
     libelf-dev \
     libiberty-dev \
     libpcap-dev \
     llvm-dev \
-    liblldb-dev \
     libclang-dev \
-    systemtap-sdt-dev \
+    libclang-cpp-dev \
+    pahole \
+    xxd \
+    zip \
     zlib1g-dev
 
 COPY . /src
 WORKDIR /src
-RUN cmake -B /build -DBUILD_TESTING=OFF
+
+# Use CMAKE_BUILD_TYPE=Release if you don't plan on developing bpftrace
+# We set USE_SYSTEM_LIBBPF=On to test that bpftrace can build with system libbpf
+# (i.e. not using libbpf from the submodule)
+RUN cmake -B /build -DBUILD_TESTING=OFF -DCMAKE_BUILD_TYPE=Debug -DUSE_SYSTEM_LIBBPF=On
 RUN make -C /build -j$(nproc)
 
 ENTRYPOINT ["/build/src/bpftrace"]

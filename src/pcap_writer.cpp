@@ -15,7 +15,7 @@ bool PCAPwriter::open(std::string file)
   return true;
 }
 
-void PCAPwriter::close(void)
+void PCAPwriter::close()
 {
   pcap_close(pd_);
   pcap_dump_close(pdumper_);
@@ -24,7 +24,7 @@ void PCAPwriter::close(void)
 #define NSEC_PER_SEC 1000000000L
 #define NSEC_PER_USEC 1000L
 
-bool PCAPwriter::write(uint64_t ns, void *pkt, unsigned int size)
+bool PCAPwriter::write(uint64_t ns, const void *pkt, unsigned int size)
 {
   time_t secs, usecs, nsecs = ns;
 
@@ -41,7 +41,9 @@ bool PCAPwriter::write(uint64_t ns, void *pkt, unsigned int size)
     .len    = size,
   };
 
-  pcap_dump((u_char *)pdumper_, &hdr, (const u_char *)pkt);
+  pcap_dump(reinterpret_cast<u_char *>(pdumper_),
+            &hdr,
+            static_cast<const u_char *>(pkt));
   return true;
 }
 
@@ -61,7 +63,7 @@ void PCAPwriter::close(void)
 }
 
 bool PCAPwriter::write(uint64_t ns __attribute__((__unused__)),
-                       void *pkt __attribute__((__unused__)),
+                       const void *pkt __attribute__((__unused__)),
                        unsigned int size __attribute__((__unused__)))
 {
   return false;

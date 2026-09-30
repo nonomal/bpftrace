@@ -1,12 +1,10 @@
-#include "ast/async_event_types.h"
-
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/Type.h>
 
+#include "ast/async_event_types.h"
 #include "ast/irbuilderbpf.h"
 
-namespace bpftrace {
-namespace AsyncEvent {
+namespace bpftrace::AsyncEvent {
 
 std::vector<llvm::Type*> Print::asLLVMType(ast::IRBuilderBPF& b)
 {
@@ -53,37 +51,20 @@ std::vector<llvm::Type*> Strftime::asLLVMType(ast::IRBuilderBPF& b)
   };
 }
 
-std::vector<llvm::Type*> Buf::asLLVMType(ast::IRBuilderBPF& b, size_t length)
+std::vector<llvm::Type*> Buf::asLLVMType(ast::IRBuilderBPF& b, uint32_t length)
 {
   return {
-    b.getInt8Ty(),                               // buffer length
+    b.getInt32Ty(),                              // buffer length
     llvm::ArrayType::get(b.getInt8Ty(), length), // buffer content
   };
 }
 
-std::vector<llvm::Type*> HelperError::asLLVMType(ast::IRBuilderBPF& b)
+std::vector<llvm::Type*> RuntimeError::asLLVMType(ast::IRBuilderBPF& b)
 {
   return {
     b.getInt64Ty(), // asyncid
     b.getInt64Ty(), // error_id
     b.getInt32Ty(), // return value
-  };
-}
-
-std::vector<llvm::Type*> Watchpoint::asLLVMType(ast::IRBuilderBPF& b)
-{
-  return {
-    b.getInt64Ty(), // asyncid
-    b.getInt64Ty(), // watchpoint_idx
-    b.getInt64Ty(), // addr
-  };
-}
-
-std::vector<llvm::Type*> WatchpointUnwatch::asLLVMType(ast::IRBuilderBPF& b)
-{
-  return {
-    b.getInt64Ty(), // asyncid
-    b.getInt64Ty(), // addr
   };
 }
 
@@ -104,5 +85,21 @@ std::vector<llvm::Type*> SkbOutput::asLLVMType(ast::IRBuilderBPF& b)
   };
 }
 
-} // namespace AsyncEvent
-} // namespace bpftrace
+std::vector<llvm::Type*> Exit::asLLVMType(ast::IRBuilderBPF& b)
+{
+  return {
+    b.getInt64Ty(), // asyncid
+    b.getInt8Ty(),  // exit_code
+  };
+}
+
+std::vector<llvm::Type*> Join::asLLVMType(ast::IRBuilderBPF& b, uint32_t length)
+{
+  return {
+    b.getInt64Ty(),                              // action_id
+    b.getInt64Ty(),                              // join_id
+    llvm::ArrayType::get(b.getInt8Ty(), length), // join content
+  };
+}
+
+} // namespace bpftrace::AsyncEvent

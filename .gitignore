@@ -2,7 +2,9 @@
 build/
 build-*/
 tests/runtime/*.pyc
+.direnv
 .vagrant
+.vmtest.log
 tests/**/*.bc
 *~
 \#*\#
@@ -16,3 +18,5 @@ tests/**/*.bc
 
 result
 ignored/
+
+.claude/

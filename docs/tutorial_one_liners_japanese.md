@@ -21,7 +21,7 @@ bpftrace -l 'tracepoint:syscalls:sys_enter_*'
 
 ```
 # bpftrace -e 'BEGIN { printf("hello world\n"); }'
-Attaching 1 probe...
+Attached 1 probe
 hello world
 ^C
 ```
@@ -34,8 +34,8 @@ hello world
 # レッスン 3. ファイルのオープン
 
 ```
-# bpftrace -e 'tracepoint:syscalls:sys_enter_openat { printf("%s %s\n", comm, str(args->filename)); }'
-Attaching 1 probe...
+# bpftrace -e 'tracepoint:syscalls:sys_enter_openat { printf("%s %s\n", comm, str(args.filename)); }'
+Attached 1 probe
 snmp-pass /proc/cpuinfo
 snmp-pass /proc/stat
 snmpd /proc/net/dev
@@ -48,7 +48,7 @@ snmpd /proc/net/if_inet6
 - `tracepoint:syscalls:sys_enter_openat` は tracepoint プローブ（カーネルの静的トレーシング）です．これにより `openat()` システムコール呼び出し時にイベントが発生します．Tracepoint の API は安定性が保証されているため，kprobe（カーネルの動的トレーシング，レッスン6で紹介）よりも利用が推奨されます．なお，最近の Linux（カーネル2.26以上）では `open` 関数は常に `openat` システムコールを呼びます．
 - `comm` はビルトイン変数の一つで，現在のプロセス名を保持します．同様のビルトイン変数に pid や tid があります．
 - `args` は対象の tracepoint の全ての引数を含む構造体へのポインタです．この構造体は tracepoint の情報に基づいて bpftrace が自動で生成します．構造体のメンバの情報は `bpftrace -vl tracepoint:syscalls:sys_enter_openat` で調べることができます．
-- `args->filename` は `args` 構造体を参照してメンバ変数 `filename` の値を取得します．
+- `args.filename` は `args` 構造体を参照してメンバ変数 `filename` の値を取得します．
 - `str()` はポインタを文字列に変換します．（訳注：bpftrace はポインタと文字列を別々のものとして扱います．printf("%s") の引数には文字列を与える必要があります． ）
 
 
@@ -58,7 +58,7 @@ snmpd /proc/net/if_inet6
 
 ```
 bpftrace -e 'tracepoint:raw_syscalls:sys_enter { @[comm] = count(); }'
-Attaching 1 probe...
+Attached 1 probe
 ^C
 
 @[bpftrace]: 6
@@ -78,8 +78,8 @@ Attaching 1 probe...
 # レッスン 5. read() のバイト数の分布
 
 ```
-# bpftrace -e 'tracepoint:syscalls:sys_exit_read /pid == 18644/ { @bytes = hist(args->ret); }'
-Attaching 1 probe...
+# bpftrace -e 'tracepoint:syscalls:sys_exit_read /pid == 18644/ { @bytes = hist(args.ret); }'
+Attached 1 probe
 ^C
 
 @bytes:
@@ -105,7 +105,7 @@ PID 18644 のプロセスによるカーネル関数 sys_read() の戻り値を�
 
 ```
 # bpftrace -e 'kretprobe:vfs_read { @bytes = lhist(retval, 0, 2000, 200); }'
-Attaching 1 probe...
+Attached 1 probe
 ^C
 
 @bytes:
@@ -131,8 +131,8 @@ read() のバイト数を線形スケールのヒストグラムとして集計�
 # レッスン 7. read() の実行時間の測定
 
 ```
-# bpftrace -e 'kprobe:vfs_read { @start[tid] = nsecs; } kretprobe:vfs_read /@start[tid]/ { @ns[comm] = hist(nsecs - @start[tid]); delete(@start[tid]); }'
-Attaching 2 probes...
+# bpftrace -e 'kprobe:vfs_read { @start[tid] = nsecs; } kretprobe:vfs_read /@start[tid]/ { @ns[comm] = hist(nsecs - @start[tid]); delete(@start, tid); }'
+Attached 2 probes
 
 [...]
 @ns[snmp-pass]:
@@ -165,13 +165,13 @@ read() の実行時間をナノ秒単位で計測し，プロセスごとにヒ�
 - nsecs: マシン起動からのナノ秒を意味します．これは高精度のタイムスタンプカウンターの値で，イベント時刻の測定に利用できます．
 - /@start[tid]/: このフィルタは開始時間が記録されているかをチェックします．このフィルタが無い場合，このプログラムはある read の開始後に実行され，その read の終了のイベントのみを捕捉する可能性があります．この場合，結果として 現在時刻 - 開始時間ではなく，現在時刻 - 0 を計算することになります．（訳注：存在しないキーに対するマップアクセスは0を返します）
 
-- delete(@start[tid]]): 変数を解放します．（訳注：delete をしたマップの値は，プログラム終了時に表示されません．）
+- delete(@start, tid): 変数を解放します．（訳注：delete をしたマップの値は，プログラム終了時に表示されません．）
 
 # レッスン 8. プロセスレベルのイベントの計数
 
 ```
 # bpftrace -e 'tracepoint:sched:sched* { @[probe] = count(); } interval:s:5 { exit(); }'
-Attaching 25 probes...
+Attached 25 probes
 @[tracepoint:sched:sched_wakeup_new]: 1
 @[tracepoint:sched:sched_process_fork]: 1
 @[tracepoint:sched:sched_process_exec]: 1
@@ -196,7 +196,7 @@ Attaching 25 probes...
 
 ```
 # bpftrace -e 'profile:hz:99 { @[kstack] = count(); }'
-Attaching 1 probe...
+Attached 1 probe
 ^C
 
 [...]
@@ -259,8 +259,8 @@ secondary_startup_64+165
 # Lesson 11. ブロック I/O のトレーシング
 
 ```
-# bpftrace -e 'tracepoint:block:block_rq_issue { @ = hist(args->bytes); }'
-Attaching 1 probe...
+# bpftrace -e 'tracepoint:block:block_rq_issue { @ = hist(args.bytes); }'
+Attached 1 probe
 ^C
 
 @:
@@ -289,7 +289,7 @@ Attaching 1 probe...
 
 - tracepoint:block: tracepoint の block カテゴリは様々なブロックI/O（ストレージ）イベントをトレースします．
 - block_rq_issue: デバイスに I/O が発行された時にイベントが発生します．
-- args->bytes: Tracepoint の block_rq_issue の引数のメンバ変数で，ブロックI/Oのサイズをバイト単位で表します．
+- args.bytes: Tracepoint の block_rq_issue の引数のメンバ変数で，ブロックI/Oのサイズをバイト単位で表します．
 
 このプローブのコンテキストは重要です．このイベントはデバイスに対して I/O が発行されたときに発生します．これはよくプロセスコンテキストで発生し，その場合ビルトイン変数，例えば comm はそのときのプロセス名を意味しますが，このイベントはカーネルコンテキスト（例えば readahead）でも発生します．この場合 pid や comm は予期しないものになるでしょう．
 
@@ -308,7 +308,7 @@ kprobe:vfs_open
 }
 
 # bpftrace path.bt
-Attaching 1 probe...
+Attached 1 probe
 open path: dev
 open path: if_inet6
 open path: retrans_time_ms
@@ -325,4 +325,3 @@ open path: retrans_time_ms
 カーネル構造体のサポートは bcc と同様にカーネルヘッダを利用します．したがって多くの構造体が利用可能ですが，全てではありません．場合によっては手動で構造体を定義する必要があります．例えば [dcsnoop tool](../tools/dcsnoop.bt) では nameidata 構造体の一部を手動で定義しています．これはこの構造体がヘッダ内で定義されていないためです．LinuxカーネルのBTFデータがある場合，全ての構造体が利用可能です．
 
 ここまでで bpftrace の多くを理解し，強力なワンライナーを作成・利用することができます．bpftrace のその他の機能については [インストラクションマニュアル](../man/adoc/bpftrace.adoc) を参照して下さい．
-

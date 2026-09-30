@@ -2,95 +2,90 @@
 
 #include <ostream>
 #include <regex>
+#include <string>
+#include <tuple>
+#include <utility>
 #include <vector>
 
-#include "printf.h"
+#include "types.h"
 
 namespace bpftrace {
 
-/**
- * validate_fmt makes sure that the type are valid for the format specifiers
- */
-std::string validate_format_string(const std::string &fmt,
-                                   std::vector<Field> args,
-                                   const std::string call_func);
-
-struct Field;
-/*
-**
-*/
-class FormatString {
-private:
-  /**
-   * Split the format string on format specifiers, e.g.
-   * 'foo %s bar' -> [ 'foo %s', 'bar' ]
-   */
-  void split();
-
+class FormatError : public ErrorInfo<FormatError> {
 public:
-  /*
-   * NOTE: As format strings are used as a vector of tuples the cereal
-   * serialization can get hairy. Having a public constructor makes it easier.
-   */
-  FormatString() = default;
+  FormatError(std::string msg) : msg_(std::move(msg)) {};
+  static char ID;
+  void log(llvm::raw_ostream &OS) const override;
 
-  FormatString(const char *s) : fmt_(s){};
-  FormatString(std::string &s) : fmt_(s){};
+private:
+  std::string msg_;
+};
 
-  /**
-   * format formats the format string with the given args. Its up to the caller
-   * to ensure that the argument types match those of the call to validate_types
-   */
-  void format(std::ostream &out,
-              std::vector<std::unique_ptr<IPrintable>> &args);
+namespace output {
+struct Primitive;
+} // namespace output
 
-  /**
-   * format_str is similar to format but returns a string instead of writing to
-   * an ostream
-   */
-  std::string format_str(std::vector<std::unique_ptr<IPrintable>> &args);
+// FormatSpec is a parsed format token.
+class FormatSpec {
+public:
+  bool left_align = false;     // -
+  bool show_sign = false;      // +
+  bool space_prefix = false;   // (space)
+  bool alternate_form = false; // #
+  bool lead_zeros = false;     // 0
+  int width = 0;               // field width
+  int precision = -1;          // precision after decimal point
+  std::string length_modifier; // h, l, ll, etc.
+  std::string specifier;       // d, s, x, etc.
+private:
+  static const std::regex regex;
+  FormatSpec(const std::smatch &match);
+  Result<std::string> apply(const output::Primitive &p) const;
+  friend class FormatString;
+};
 
-  /**
-   * length returns the length of the format string
-   */
-  inline size_t length() const noexcept
-  {
-    return fmt_.length();
-  };
-  inline size_t size() const noexcept
-  {
-    return length();
-  };
+class FormatString {
+public:
+  FormatString();
+  FormatString(std::string fmt);
+  ~FormatString();
 
-  /**
-   * str returns the format string as std::string
-   */
-  inline std::string str() const
+  // check can be used to check if the format is valid, given a set of arguments
+  // passed in. This does a best effort analysis based on the types.
+  Result<> check(const std::vector<SizedType> &args) const;
+
+  // format formats the format string with the given args. Its up to the
+  // caller to ensure that the argument types match those of the call to
+  // validate_types.
+  std::string format(const std::vector<output::Primitive> &args) const;
+
+  // returns the original format string.
+  const std::string &str() const
   {
     return fmt_;
-  };
+  }
 
-  /**
-   * c_str returns the format string as c string
-   * */
-  inline const char *c_str() const noexcept
-  {
-    return fmt_.c_str();
-  };
+  // These may be used by callers to do manual validation. The fragments must be
+  // exactly one element larger than the specs, and the sequence that is
+  // constructed is: (fragment, spec, fragment, ..., spec, fragment).
+  std::vector<std::string> fragments;
+  std::vector<FormatSpec> specs;
 
 private:
   std::string fmt_;
-  std::vector<std::string> parts_;
-  std::vector<ArgumentType> expected_types_;
+
+  // parses the internal format string.
+  void parse();
 
   friend class cereal::access;
 
   template <typename Archive>
   void serialize(Archive &ar)
   {
-    // NOTE: parts_ is not constructed until first use, so no point in
-    // serializing it
     ar(fmt_);
+    if (fragments.empty() && specs.empty()) {
+      parse();
+    }
   }
 };
 

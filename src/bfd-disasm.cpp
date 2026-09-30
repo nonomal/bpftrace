@@ -6,25 +6,25 @@
 // bfd.h assumes everyone is using autotools and will error out unless
 // PACKAGE is defined. Some distros patch this check out.
 #define PACKAGE "bpftrace"
-#include "bfd-disasm.h"
-#include "utils.h"
-#include <bcc/bcc_elf.h>
-#include <bcc/bcc_syms.h>
 #include <bfd.h>
 #include <dis-asm.h>
+#include <filesystem>
+
+#include "bfd-disasm.h"
+#include "util/system.h"
 
 namespace bpftrace {
 
-BfdDisasm::BfdDisasm(std::string &path) : size_(0)
+BfdDisasm::BfdDisasm(std::string &path)
 {
   fd_ = open(path.c_str(), O_RDONLY);
 
   if (fd_ >= 0) {
     std::error_code ec;
-    std_filesystem::path fs_path{ path };
+    std::filesystem::path fs_path{ path };
     std::uintmax_t file_size = std::filesystem::file_size(fs_path, ec);
 
-    if (file_size != static_cast<std::uintmax_t>(-1)) {
+    if (!ec) {
       size_ = file_size;
     }
   }
@@ -36,6 +36,7 @@ BfdDisasm::~BfdDisasm()
     close(fd_);
 }
 
+// NOLINTNEXTLINE(modernize-avoid-variadic-functions): required by libbfd API
 static int fprintf_nop(void *out __attribute__((unused)),
                        const char *fmt __attribute__((unused)),
                        ...)
@@ -44,6 +45,7 @@ static int fprintf_nop(void *out __attribute__((unused)),
 }
 
 #ifdef LIBBFD_INIT_DISASM_INFO_FOUR_ARGS_SIGNATURE
+// NOLINTNEXTLINE(modernize-avoid-variadic-functions): required by libbfd API
 static int fprintf_styled_nop(void *out __attribute__((unused)),
                               enum disassembler_style s __attribute__((unused)),
                               const char *fmt __attribute__((unused)),
@@ -57,10 +59,14 @@ static AlignState is_aligned_buf(void *buf, uint64_t size, uint64_t offset)
 {
   disassembler_ftype disassemble;
   struct disassemble_info info;
-  std::string tpath = get_pid_exe("self");
+  auto tpath = util::get_pid_exe("self");
+  if (!tpath) {
+    return AlignState::Fail;
+  }
+
   bfd *bfdf;
 
-  bfdf = bfd_openr(tpath.c_str(), nullptr);
+  bfdf = bfd_openr(tpath->c_str(), nullptr);
   if (bfdf == nullptr)
     return AlignState::Fail;
 
@@ -82,11 +88,7 @@ static AlignState is_aligned_buf(void *buf, uint64_t size, uint64_t offset)
 
   disassemble_init_for_target(&info);
 
-#ifdef LIBBFD_DISASM_FOUR_ARGS_SIGNATURE
   disassemble = disassembler(info.arch, bfd_big_endian(bfdf), info.mach, bfdf);
-#else
-  disassemble = disassembler(bfdf);
-#endif
 
   uint64_t pc = 0;
   int count;

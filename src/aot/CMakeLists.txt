@@ -1,9 +1,6 @@
-add_library(aot aot.cpp)
-add_dependencies(aot parser version_h)
+add_library(aot STATIC aot.cpp)
+add_dependencies(aot version_h)
 target_link_libraries(aot required_resources)
-target_include_directories(aot PUBLIC ${CMAKE_SOURCE_DIR}/src)
-target_include_directories(aot PUBLIC ${CMAKE_BINARY_DIR}/src)
-target_include_directories(aot PUBLIC ${CMAKE_BINARY_DIR})
 target_compile_definitions(aot PRIVATE ${BPFTRACE_FLAGS})
 
 if(STATIC_LINKING)
@@ -19,7 +16,8 @@ if(NOT LIBBCC_BPF_CONTAINS_RUNTIME)
 endif()
 
 add_executable(bpftrace-aotrt aot_main.cpp)
-target_link_libraries(bpftrace-aotrt aot runtime arch ast ast_defs cxxdemangler_stdlib)
+target_compile_definitions(bpftrace-aotrt PRIVATE ${BPFTRACE_FLAGS})
+target_link_libraries(bpftrace-aotrt aot runtime arch ast ast_defs util cxxdemangler_stdlib)
 install(TARGETS bpftrace-aotrt DESTINATION ${CMAKE_INSTALL_BINDIR})
 
 if(LIBPCAP_FOUND)
@@ -27,12 +25,13 @@ if(LIBPCAP_FOUND)
 endif(LIBPCAP_FOUND)
 
 # Linking
-if(STATIC_LINKING)
-  target_link_options(bpftrace-aotrt  BEFORE PRIVATE "-static-libgcc" "-static-libstdc++")
-endif(STATIC_LINKING)
+target_link_options(bpftrace-aotrt BEFORE PRIVATE
+  $<$<BOOL:${STATIC_LINKING}>:-static-libgcc>
+  $<$<BOOL:${STATIC_LINKING}>:-static-libstdc++>
+)
 
-# ASAN
-if(BUILD_ASAN)
-  target_compile_options(bpftrace-aotrt PUBLIC "-fsanitize=address")
-  target_link_options(bpftrace-aotrt PUBLIC "-fsanitize=address")
-endif()
+# ASAN/UBSAN
+target_link_options(bpftrace-aotrt PUBLIC
+  $<$<BOOL:${BUILD_ASAN}>:-fsanitize=address>
+  $<$<BOOL:${BUILD_UBSAN}>:-fsanitize=undefined>
+)

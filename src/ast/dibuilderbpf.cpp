@@ -1,32 +1,41 @@
-#include "dibuilderbpf.h"
+#include <bpf/bpf.h>
+#include <llvm/IR/Function.h>
+#include <string_view>
 
+#include "dibuilderbpf.h"
 #include "log.h"
 #include "struct.h"
-#include "utils.h"
+#include "types.h"
+#include "util/bpf_names.h"
 
-#include <llvm/IR/Function.h>
-
-namespace bpftrace {
-namespace ast {
+namespace bpftrace::ast {
 
 DIBuilderBPF::DIBuilderBPF(Module &module) : DIBuilder(module)
 {
   file = createFile("bpftrace.bpf.o", ".");
 }
 
-void DIBuilderBPF::createFunctionDebugInfo(Function &func)
+DILocalScope *DIBuilderBPF::createFunctionDebugInfo(llvm::Function &func,
+                                                    const SizedType &ret_type,
+                                                    const Struct &args,
+                                                    bool is_declaration)
 {
-  // BPF probe function has:
-  // - int return type
-  // - single parameter (ctx) of a pointer type
-  SmallVector<Metadata *, 2> types = { getInt64Ty(), getInt8PtrTy() };
+  // Return type should be at index 0
+  SmallVector<Metadata *> types;
+  types.reserve(args.fields.size() + 1);
+  types.push_back(GetType(ret_type));
+  for (const auto &arg : args.fields)
+    types.push_back(GetType(arg.type));
 
   DISubroutineType *ditype = createSubroutineType(getOrCreateTypeArray(types));
 
-  std::string sanitised_name = sanitise_bpf_program_name(func.getName().str());
+  std::string sanitised_name = util::sanitise_bpf_program_name(
+      func.getName().str());
 
-  DISubprogram::DISPFlags flags = DISubprogram::SPFlagDefinition;
-  if (func.isLocalLinkage(func.getLinkage()))
+  DISubprogram::DISPFlags flags = DISubprogram::SPFlagZero;
+  if (!is_declaration)
+    flags |= DISubprogram::SPFlagDefinition;
+  if (llvm::Function::isLocalLinkage(func.getLinkage()))
     flags |= DISubprogram::DISPFlags::SPFlagLocalToUnit;
 
   DISubprogram *subprog = createFunction(file,
@@ -39,9 +48,28 @@ void DIBuilderBPF::createFunctionDebugInfo(Function &func)
                                          DINode::FlagPrototyped,
                                          flags);
 
-  createParameterVariable(subprog, "ctx", 1, file, 0, (DIType *)types[1], true);
+  for (size_t i = 0; i < args.fields.size(); i++) {
+    createParameterVariable(subprog,
+                            args.fields.at(i).name,
+                            i + 1,
+                            file,
+                            0,
+                            static_cast<DIType *>(types[i + 1]),
+                            true);
+  }
 
   func.setSubprogram(subprog);
+  return subprog;
+}
+
+DILocalScope *DIBuilderBPF::createProbeDebugInfo(llvm::Function &probe_func)
+{
+  // BPF probe function has:
+  // - int return type
+  // - single parameter (ctx) of a pointer type
+  Struct args;
+  args.AddField("ctx", CreatePointer(CreateInt8()));
+  return createFunctionDebugInfo(probe_func, CreateInt64(), args);
 }
 
 DIType *DIBuilderBPF::getInt8Ty()
@@ -123,27 +151,198 @@ DIType *DIBuilderBPF::CreateTupleType(const SizedType &stype)
   return result;
 }
 
+// Create anonymous struct with named fields. It's possible that there will
+// be multiple records of the same (duplicated) type but BTF deduplication
+// should take care of that.
+DIType *DIBuilderBPF::CreateRecordType(const SizedType &stype)
+{
+  assert(stype.IsRecordTy());
+
+  SmallVector<Metadata *, 8> fields;
+  for (auto &field : stype.GetFields()) {
+    fields.push_back(createMemberType(file,
+                                      field.name,
+                                      file,
+                                      0,
+                                      field.type.GetSize() * 8,
+                                      0,
+                                      field.offset * 8,
+                                      DINode::FlagZero,
+                                      GetType(field.type)));
+  }
+  DICompositeType *result = createStructType(file,
+                                             "",
+                                             file,
+                                             0,
+                                             stype.GetSize() * 8,
+                                             0,
+                                             DINode::FlagZero,
+                                             nullptr,
+                                             getOrCreateArray(fields));
+  return result;
+}
+
+DIType *DIBuilderBPF::CreateMapStructType(const SizedType &stype)
+{
+  assert(stype.IsMinTy() || stype.IsMaxTy() || stype.IsAvgTy() ||
+         stype.IsStatsTy());
+
+  // For Min/Max, the first field is the value and the second field is the
+  // "value is set" flag. For Avg/Stats, the first field is the total and the
+  // second field is the count.
+  SmallVector<Metadata *, 2> fields = { createMemberType(file,
+                                                         "",
+                                                         file,
+                                                         0,
+                                                         stype.GetSize() * 8,
+                                                         0,
+                                                         0,
+                                                         DINode::FlagZero,
+                                                         getInt64Ty()),
+                                        createMemberType(file,
+                                                         "",
+                                                         file,
+                                                         0,
+                                                         stype.GetSize() * 8,
+                                                         0,
+                                                         stype.GetSize() * 8,
+                                                         DINode::FlagZero,
+                                                         getInt32Ty()) };
+
+  DICompositeType *result = createStructType(file,
+                                             "",
+                                             file,
+                                             0,
+                                             (stype.GetSize() * 8) * 2,
+                                             0,
+                                             DINode::FlagZero,
+                                             nullptr,
+                                             getOrCreateArray(fields));
+  return result;
+}
+
+DIType *DIBuilderBPF::CreateTSeriesStructType(const SizedType &stype)
+{
+  assert(stype.IsTSeriesTy());
+
+  // The first field is the value, the second field is metadata associated with
+  // the value, and the third field is the epoch, a number representing the
+  // bucket's time interval. The interpretation of the value and metadata fields
+  // depends on the time series's aggregation function:
+  //
+  // +-----+-------+----------+----------------------------------------------+
+  // | agg | value | metadata | explanation                                  |
+  // +-----+-------+----------+----------------------------------------------+
+  // | avg | total | count    | avg = total / count                          |
+  // | max | max   | is_set   | is_set = "value is set"                      |
+  // | min | min   | is_set   | is_set = "value is set"                      |
+  // | sum | sum   | -        | metadata not used                            |
+  // | -   | value | now      | now is the timestamp when value was recorded |
+  // +-----+-------+----------+----------------------------------------------+
+  SmallVector<Metadata *, 3> fields = { createMemberType(file,
+                                                         "",
+                                                         file,
+                                                         0,
+                                                         stype.GetSize() * 8,
+                                                         0,
+                                                         0,
+                                                         DINode::FlagZero,
+                                                         getInt64Ty()),
+                                        createMemberType(file,
+                                                         "",
+                                                         file,
+                                                         0,
+                                                         stype.GetSize() * 8,
+                                                         0,
+                                                         stype.GetSize() * 8,
+                                                         DINode::FlagZero,
+                                                         getInt64Ty()),
+                                        createMemberType(file,
+                                                         "",
+                                                         file,
+                                                         0,
+                                                         stype.GetSize() * 8,
+                                                         0,
+                                                         stype.GetSize() * 16,
+                                                         DINode::FlagZero,
+                                                         getInt64Ty()) };
+  DICompositeType *result = createStructType(file,
+                                             "",
+                                             file,
+                                             0,
+                                             (stype.GetSize() * 8) * 3,
+                                             0,
+                                             DINode::FlagZero,
+                                             nullptr,
+                                             getOrCreateArray(fields));
+  return result;
+}
+
+DIType *DIBuilderBPF::CreateByteArrayType(uint64_t num_bytes)
+{
+  auto *subrange = getOrCreateSubrange(0, num_bytes);
+  return createArrayType(
+      num_bytes * 8, 0, getInt8Ty(), getOrCreateArray({ subrange }));
+}
+
+/// Convert internal SizedType to a corresponding DIType type.
+///
+/// In codegen, some types are not converted into a directly corresponding
+/// LLVM type but instead into a type which is easy to work with in BPF
+/// programs (see IRBuilderBPF::GetType for details).
+///
+/// As opposed to IRBuilderBPF::GetType we need to emit proper struct type
+/// info for the c_type SizedType whose BTF must exactly match the kernel
+/// BTF (e.g. kernel functions ("kfunc") prototypes). For debug info the name
+/// and size need to at least be correct but the fields are not necessary.
 DIType *DIBuilderBPF::GetType(const SizedType &stype)
 {
-  if (stype.IsByteArray() || stype.IsRecordTy()) {
-    auto subrange = getOrCreateSubrange(0, stype.GetSize());
+  if (stype.IsCTypeTy()) {
+    return createStructType(file,
+                            std::string(stype.GetBaseName()),
+                            file,
+                            0,
+                            stype.GetSize() * 8,
+                            0,
+                            DINode::FlagZero,
+                            nullptr,
+                            getOrCreateArray({}));
+  }
+
+  if (stype.IsByteArray() || stype.IsStack()) {
+    auto *subrange = getOrCreateSubrange(0, stype.GetSize());
     return createArrayType(
         stype.GetSize() * 8, 0, getInt8Ty(), getOrCreateArray({ subrange }));
   }
 
   if (stype.IsArrayTy()) {
-    auto subrange = getOrCreateSubrange(0, stype.GetNumElements());
+    auto *subrange = getOrCreateSubrange(0, stype.GetNumElements());
     return createArrayType(stype.GetSize() * 8,
                            0,
-                           GetType(*stype.GetElementTy()),
+                           GetType(stype.GetElementTy()),
                            getOrCreateArray({ subrange }));
   }
 
   if (stype.IsTupleTy())
     return CreateTupleType(stype);
 
-  if (stype.IsPtrTy())
-    return getInt64Ty();
+  if (stype.IsRecordTy())
+    return CreateRecordType(stype);
+
+  if (stype.IsMinTy() || stype.IsMaxTy() || stype.IsAvgTy() ||
+      stype.IsStatsTy())
+    return CreateMapStructType(stype);
+  else if (stype.IsTSeriesTy())
+    return CreateTSeriesStructType(stype);
+
+  if (stype.IsPtrTy()) {
+    // We shouldn't need to handle bare void types as they can't be assigned to
+    // variables or be used as map keys/values
+    if (stype.GetPointeeTy().IsVoidTy()) {
+      return createPointerType(nullptr, 64);
+    }
+    return createPointerType(GetType(stype.GetPointeeTy()), 64);
+  }
 
   // Integer types and builtin types represented by integers
   switch (stype.GetSize()) {
@@ -163,37 +362,31 @@ DIType *DIBuilderBPF::GetType(const SizedType &stype)
   }
 }
 
-DIType *DIBuilderBPF::GetMapKeyType(const MapKey &key,
-                                    const SizedType &value_type)
+DIType *DIBuilderBPF::GetMapKeyType(const SizedType &key_type,
+                                    const SizedType &value_type,
+                                    bpf_map_type map_type)
 {
-  // No-key maps use '0' as the key.
-  // No-key count() maps use BPF_MAP_TYPE_PERCPU_ARRAY which needs 4-byte key.
-  if (key.args_.size() == 0)
-    return value_type.IsCountTy() ? getInt32Ty() : getInt64Ty();
+  if (map_type == BPF_MAP_TYPE_RINGBUF) {
+    assert(key_type.IsNoneTy());
+    return getInt64Ty();
+  }
 
   // Some map types need an extra 8-byte key.
-  uint64_t extra_arg_size = 0;
-  if (value_type.IsHistTy() || value_type.IsLhistTy() || value_type.IsAvgTy() ||
-      value_type.IsStatsTy())
-    extra_arg_size = 8;
+  if (value_type.IsHistTy() || value_type.IsLhistTy() ||
+      value_type.IsTSeriesTy()) {
+    uint64_t size = key_type.GetSize() + 8;
+    return CreateByteArrayType(size);
+  }
 
-  // Single map key -> use the appropriate type.
-  if (key.args_.size() == 1 && extra_arg_size == 0)
-    return GetType(key.args_[0]);
-
-  // Multi map key -> use byte array.
-  uint64_t size = key.size() + extra_arg_size;
-  auto subrange = getOrCreateSubrange(0, size);
-  return createArrayType(
-      size * 8, 0, getInt8Ty(), getOrCreateArray({ subrange }));
+  return GetType(key_type);
 }
 
 DIType *DIBuilderBPF::GetMapFieldInt(int value)
 {
   // Integer fields of map entry are represented by 64-bit pointers to an array
   // of int, in which dimensionality of the array encodes the specified value.
-  auto subrange = getOrCreateSubrange(0, value);
-  auto array = createArrayType(
+  auto *subrange = getOrCreateSubrange(0, value);
+  auto *array = createArrayType(
       32 * value, 0, getIntTy(), getOrCreateArray({ subrange }));
   return createPointerType(array, 64);
 }
@@ -208,9 +401,9 @@ DIType *DIBuilderBPF::createPointerMemberType(const std::string &name,
 
 DIGlobalVariableExpression *DIBuilderBPF::createMapEntry(
     const std::string &name,
-    libbpf::bpf_map_type map_type,
+    bpf_map_type map_type,
     uint64_t max_entries,
-    const MapKey &key,
+    DIType *key_type,
     const SizedType &value_type)
 {
   SmallVector<Metadata *, 4> fields = {
@@ -220,8 +413,8 @@ DIGlobalVariableExpression *DIBuilderBPF::createMapEntry(
 
   uint64_t size = 128;
   if (!value_type.IsNoneTy()) {
-    fields.push_back(createPointerMemberType(
-        "key", size, createPointerType(GetMapKeyType(key, value_type), 64)));
+    fields.push_back(
+        createPointerMemberType("key", size, createPointerType(key_type, 64)));
     fields.push_back(createPointerMemberType(
         "value", size + 64, createPointerType(GetType(value_type), 64)));
     size += 128;
@@ -240,5 +433,19 @@ DIGlobalVariableExpression *DIBuilderBPF::createMapEntry(
       file, name, "global", file, 0, map_entry_type, false);
 }
 
-} // namespace ast
-} // namespace bpftrace
+DIGlobalVariableExpression *DIBuilderBPF::createGlobalVariable(
+    std::string_view name,
+    const SizedType &stype)
+{
+  return createGlobalVariableExpression(
+      file, name, "global", file, 0, GetType(stype), false);
+}
+
+DILocation *DIBuilderBPF::createDebugLocation(llvm::LLVMContext &ctx,
+                                              DILocalScope *scope,
+                                              const ast::Location &loc)
+{
+  return llvm::DILocation::get(ctx, loc->line(), loc->column(), scope);
+}
+
+} // namespace bpftrace::ast

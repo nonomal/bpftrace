@@ -1,10 +1,4 @@
-#include <stdio.h>
-
-#ifdef HAVE_SYSTEMTAP_SYS_SDT_H
-#include <sys/sdt.h>
-#else
-#define DTRACE_PROBE1(a, b, c) (void)0
-#endif
+#include "libbpf-usdt/usdt.h"
 
 int main()
 {
@@ -13,7 +7,7 @@ int main()
   (void)a;
 
   while (1)
-    DTRACE_PROBE1(test, "probe1", a);
+    USDT(test, "probe1", a);
 
   return 0;
 }

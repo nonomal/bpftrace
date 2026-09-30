@@ -9,6 +9,13 @@ struct Foo {
   int a;
   char b[10];
   int c[3];
+  __int128_t d;
+};
+
+struct Bar {
+  int x;
+  struct Foo *foos[2];
+  struct Foo nested;
 };
 
 int uprobeFunction1(int *n, char c __attribute__((unused)))
@@ -20,6 +27,18 @@ struct Foo *uprobeFunction2(struct Foo *foo1,
                             struct Foo *foo2 __attribute__((unused)))
 {
   return foo1;
+}
+
+int uprobeFunctionBranching(int n)
+{
+  if (n == 1) {
+   return 1; 
+  } else if (n == 2) {
+    return 2;
+  } else {
+    return 3;
+  }
+  return 0;
 }
 
 // clang-format off
@@ -50,17 +69,49 @@ struct Foo *uprobeFunction2(struct Foo *foo1,
  */
 // clang-format on
 
+struct Bar *uprobeFunctionBar(struct Bar *bar)
+{
+  return bar;
+}
+
+__uint128_t uprobeFunctionUint128(__uint128_t x,
+                                  __uint128_t y __attribute__((unused)),
+                                  __uint128_t z __attribute__((unused)),
+                                  __uint128_t w)
+{
+  return x + w;
+}
+
 int main(int argc __attribute__((unused)), char **argv __attribute__((unused)))
 {
-  usleep(1000000);
+  while (1) {
+    int n = 13;
+    char c = 'x';
+    uprobeFunction1(&n, c);
 
-  int n = 13;
-  char c = 'x';
-  uprobeFunction1(&n, c);
+    struct Foo foo1 = {
+      .a = 123, .b = "hello", .c = { 1, 2, 3 }, .d = 0x123456789ABCDEF0
+    };
+    struct Foo foo2 = {
+      .a = 456, .b = "world", .c = { 4, 5, 6 }, .d = 0xFEDCBA9876543210
+    };
+    uprobeFunction2(&foo1, &foo2);
 
-  struct Foo foo1 = { .a = 123, .b = "hello", .c = { 1, 2, 3 } };
-  struct Foo foo2 = { .a = 456, .b = "world", .c = { 4, 5, 6 } };
-  uprobeFunction2(&foo1, &foo2);
+    uprobeFunctionBranching(n);
+
+    struct Bar bar = {
+      .x = 42, .foos = { &foo1, &foo2 }, .nested = foo1
+    };
+    uprobeFunctionBar(&bar);
+
+    __uint128_t x = 0x123456789ABCDEF0;
+    __uint128_t y = 0xEFEFEFEFEFEFEFEF;
+    __uint128_t z = 0xCDCDCDCDCDCDCDCD;
+    __uint128_t w = 0xABABABABABABABAB;
+    uprobeFunctionUint128(x, y, z, w);
+
+    usleep(100000);
+  }
 
   return 0;
 }

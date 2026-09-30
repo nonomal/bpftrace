@@ -11,21 +11,17 @@
 namespace llvm {
 class Type;
 } // namespace llvm
-namespace bpftrace {
-namespace ast {
+
+namespace bpftrace::ast {
 class IRBuilderBPF;
-} // namespace ast
-} // namespace bpftrace
+} // namespace bpftrace::ast
 
-/*
- * The main goal here is to keep the struct definitions close to each other,
- * making it easier to spot type mismatches.
- *
- * If you update a type, remember to update the .cpp too!
- */
+// The main goal here is to keep the struct definitions close to each other,
+// making it easier to spot type mismatches.
+//
+// If you update a type, remember to update the .cpp too!
 
-namespace bpftrace {
-namespace AsyncEvent {
+namespace bpftrace::AsyncEvent {
 
 struct Print {
   uint64_t action_id;
@@ -68,35 +64,15 @@ struct Strftime {
 } __attribute__((packed));
 
 struct Buf {
-  uint8_t length;
-  // Seems like GCC 7.4.x can't handle `char content[]`. Work around by using
-  // 0 sized array (a GCC extension that clang also accepts:
-  // https://gcc.gnu.org/bugzilla/show_bug.cgi?id=70932). It also looks like
-  // the issue doesn't exist in GCC 7.5.x.
-  char content[0];
+  uint32_t length;
 
-  std::vector<llvm::Type*> asLLVMType(ast::IRBuilderBPF& b, size_t length);
+  std::vector<llvm::Type*> asLLVMType(ast::IRBuilderBPF& b, uint32_t length);
 } __attribute__((packed));
 
-struct HelperError {
+struct RuntimeError {
   uint64_t action_id;
   uint64_t error_id;
   int32_t return_value;
-
-  std::vector<llvm::Type*> asLLVMType(ast::IRBuilderBPF& b);
-} __attribute__((packed));
-
-struct Watchpoint {
-  uint64_t action_id;
-  uint64_t watchpoint_idx;
-  uint64_t addr;
-
-  std::vector<llvm::Type*> asLLVMType(ast::IRBuilderBPF& b);
-} __attribute__((packed));
-
-struct WatchpointUnwatch {
-  uint64_t action_id;
-  uint64_t addr;
 
   std::vector<llvm::Type*> asLLVMType(ast::IRBuilderBPF& b);
 } __attribute__((packed));
@@ -116,5 +92,19 @@ struct SkbOutput {
   std::vector<llvm::Type*> asLLVMType(ast::IRBuilderBPF& b);
 } __attribute__((packed));
 
-} // namespace AsyncEvent
-} // namespace bpftrace
+struct Exit {
+  uint64_t action_id;
+  uint8_t exit_code;
+
+  std::vector<llvm::Type*> asLLVMType(ast::IRBuilderBPF& b);
+} __attribute__((packed));
+
+struct Join {
+  uint64_t action_id;
+  uint64_t join_id;
+  char content[0];
+
+  std::vector<llvm::Type*> asLLVMType(ast::IRBuilderBPF& b, uint32_t length);
+} __attribute__((packed));
+
+} // namespace bpftrace::AsyncEvent

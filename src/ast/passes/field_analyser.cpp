@@ -1,15 +1,59 @@
-#include "field_analyser.h"
-
+#include <bpf/bpf.h>
 #include <cassert>
-#include <iostream>
 
 #include "arch/arch.h"
+#include "ast/passes/ap_probe_expansion.h"
+#include "ast/passes/field_analyser.h"
+#include "ast/visitor.h"
+#include "bpftrace.h"
 #include "dwarf_parser.h"
-#include "log.h"
 #include "probe_matcher.h"
+#include "util/strings.h"
 
-namespace bpftrace {
-namespace ast {
+namespace bpftrace::ast {
+
+namespace {
+
+class FieldAnalyser : public Visitor<FieldAnalyser> {
+public:
+  explicit FieldAnalyser(BPFtrace &bpftrace) : bpftrace_(bpftrace)
+  {
+  }
+
+  using Visitor<FieldAnalyser>::visit;
+  void visit(Identifier &identifier);
+  void visit(Builtin &builtin);
+  void visit(Map &map);
+  void visit(Variable &var);
+  void visit(FieldAccess &acc);
+  void visit(ArrayAccess &arr);
+  void visit(MapAccess &acc);
+  void visit(Sizeof &szof);
+  void visit(Offsetof &offof);
+  void visit(Typeof &typeof);
+  void visit(AssignMapStatement &assignment);
+  void visit(AssignVarStatement &assignment);
+  void visit(Unop &unop);
+  void visit(Probe &probe);
+  void visit(Subprog &subprog);
+  void visit(Cast &cast);
+
+private:
+  void resolve_fields(SizedType &type);
+  void resolve_type(const ParsedType &type);
+
+  ProbeType probe_type_;
+  std::string attach_func_;
+  SizedType sized_type_;
+  BPFtrace &bpftrace_;
+  bpf_prog_type prog_type_{ BPF_PROG_TYPE_UNSPEC };
+  bool has_builtin_args_;
+  Probe *probe_ = nullptr;
+
+  std::map<std::string, SizedType> var_types_;
+};
+
+} // namespace
 
 void FieldAnalyser::visit(Identifier &identifier)
 {
@@ -24,10 +68,10 @@ void FieldAnalyser::visit(Builtin &builtin)
     if (!probe_)
       return;
     switch (prog_type_) {
-      case libbpf::BPF_PROG_TYPE_KPROBE:
+      case BPF_PROG_TYPE_KPROBE:
         builtin_type = "struct pt_regs";
         break;
-      case libbpf::BPF_PROG_TYPE_PERF_EVENT:
+      case BPF_PROG_TYPE_PERF_EVENT:
         builtin_type = "struct bpf_perf_event_data";
         break;
       default:
@@ -37,20 +81,18 @@ void FieldAnalyser::visit(Builtin &builtin)
     // make them resolved and available
     if (probe_type_ == ProbeType::iter)
       builtin_type = "struct bpf_iter__" + attach_func_;
-  } else if (builtin.ident == "curtask") {
+  } else if (builtin.ident == "__builtin_curtask") {
     builtin_type = "struct task_struct";
   } else if (builtin.ident == "args") {
     if (!probe_)
       return;
-    resolve_args(*probe_);
     has_builtin_args_ = true;
     return;
-  } else if (builtin.ident == "retval") {
+  } else if (builtin.ident == "__builtin_retval") {
     if (!probe_)
       return;
-    resolve_args(*probe_);
 
-    auto arg = bpftrace_.structs.GetProbeArg(*probe_, "$retval");
+    const auto *arg = bpftrace_.structs.GetProbeArg(*probe_, RETVAL_FIELD_NAME);
     if (arg)
       sized_type_ = arg->type;
     return;
@@ -62,13 +104,6 @@ void FieldAnalyser::visit(Builtin &builtin)
 
 void FieldAnalyser::visit(Map &map)
 {
-  MapKey key;
-  if (map.vargs) {
-    for (Expression *expr : *map.vargs) {
-      Visit(*expr);
-    }
-  }
-
   auto it = var_types_.find(map.ident);
   if (it != var_types_.end())
     sized_type_ = it->second;
@@ -85,194 +120,105 @@ void FieldAnalyser::visit(FieldAccess &acc)
 {
   has_builtin_args_ = false;
 
-  Visit(*acc.expr);
+  visit(acc.expr);
+
+  // Automatically resolve through pointers.
+  while (sized_type_.IsPtrTy()) {
+    sized_type_ = sized_type_.GetPointeeTy();
+    resolve_fields(sized_type_);
+  }
 
   if (has_builtin_args_) {
-    auto arg = bpftrace_.structs.GetProbeArg(*probe_, acc.field);
+    const auto *arg = bpftrace_.structs.GetProbeArg(*probe_, acc.field);
     if (arg)
       sized_type_ = arg->type;
 
     has_builtin_args_ = false;
-  } else if (!sized_type_.IsNoneTy()) {
-    // If the struct type or the field type has not been resolved, add the type
-    // to the BTF set to let ClangParser resolve it
-    if (bpftrace_.has_btf_data() && sized_type_.IsRecordTy()) {
-      SizedType field_type = CreateNone();
-      if (sized_type_.HasField(acc.field))
-        field_type = sized_type_.GetField(acc.field).type;
+  } else if (sized_type_.IsCTypeTy()) {
+    SizedType field_type = CreateNone();
+    if (sized_type_.HasField(acc.field))
+      field_type = sized_type_.GetField(acc.field).type;
 
-      if (!field_type.IsNoneTy())
-        sized_type_ = field_type;
-      else {
-        bpftrace_.btf_set_.insert(sized_type_.GetName());
-        auto field_type_name = bpftrace_.btf_->type_of(sized_type_.GetName(),
-                                                       acc.field);
-        bpftrace_.btf_set_.insert(field_type_name);
-      }
+    if (!field_type.IsNoneTy()) {
+      sized_type_ = field_type;
+    } else if (bpftrace_.has_btf_data()) {
+      // If the struct type or the field type has not been resolved, add the
+      // type to the BTF set to let ClangParser resolve it
+      bpftrace_.btf_set_.insert(sized_type_.GetName());
+      auto field_type_name = bpftrace_.btf_->type_of(sized_type_.GetName(),
+                                                     acc.field);
+      bpftrace_.btf_set_.insert(field_type_name);
     }
   }
 }
 
 void FieldAnalyser::visit(ArrayAccess &arr)
 {
-  Visit(*arr.indexpr);
-  Visit(*arr.expr);
+  visit(arr.indexpr);
+  visit(arr.expr);
   if (sized_type_.IsPtrTy()) {
-    sized_type_ = *sized_type_.GetPointeeTy();
+    sized_type_ = sized_type_.GetPointeeTy();
+    resolve_fields(sized_type_);
+  } else if (sized_type_.IsArrayTy()) {
+    sized_type_ = sized_type_.GetElementTy();
     resolve_fields(sized_type_);
   }
 }
 
-void FieldAnalyser::visit(Cast &cast)
+void FieldAnalyser::visit(MapAccess &acc)
 {
-  Visit(*cast.expr);
-  resolve_type(cast.type);
+  visit(acc.key);
+  visit(acc.map); // Leaves sized_type_ as value type.
 }
 
 void FieldAnalyser::visit(Sizeof &szof)
 {
-  if (szof.expr)
-    Visit(*szof.expr);
-  resolve_type(szof.argtype);
+  visit(*szof.type_of);
 }
 
-void FieldAnalyser::visit(Offsetof &ofof)
+void FieldAnalyser::visit(Offsetof &offof)
 {
-  if (ofof.expr)
-    Visit(*ofof.expr);
-  resolve_type(ofof.record);
+  visit(*offof.type_of);
+}
+
+void FieldAnalyser::visit(Typeof &typeof)
+{
+  if (auto *const *type = std::get_if<ParsedType *>(&typeof.record)) {
+    resolve_type(**type);
+  } else {
+    visit(typeof.record);
+  }
 }
 
 void FieldAnalyser::visit(AssignMapStatement &assignment)
 {
-  Visit(*assignment.map);
-  Visit(*assignment.expr);
-  var_types_.emplace(assignment.map->ident, sized_type_);
+  visit(assignment.map_access);
+  visit(assignment.expr);
+  var_types_.emplace(assignment.map_access->map->ident, sized_type_);
 }
 
 void FieldAnalyser::visit(AssignVarStatement &assignment)
 {
-  Visit(*assignment.expr);
-  var_types_.emplace(assignment.var->ident, sized_type_);
+  visit(assignment.expr);
+  var_types_.emplace(assignment.var()->ident, sized_type_);
 }
 
 void FieldAnalyser::visit(Unop &unop)
 {
-  Visit(*unop.expr);
+  visit(unop.expr);
   if (unop.op == Operator::MUL && sized_type_.IsPtrTy()) {
-    sized_type_ = *sized_type_.GetPointeeTy();
+    sized_type_ = sized_type_.GetPointeeTy();
     resolve_fields(sized_type_);
   }
 }
 
-void FieldAnalyser::resolve_args(Probe &probe)
-{
-  // load probe arguments into a special record type "struct <probename>_args"
-  Struct probe_args;
-  for (auto *ap : *probe.attach_points) {
-    auto probe_type = probetype(ap->provider);
-    if (probe_type != ProbeType::kfunc && probe_type != ProbeType::kretfunc &&
-        probe_type != ProbeType::uprobe)
-      continue;
-
-    if (ap->need_expansion) {
-      std::set<std::string> matches;
-
-      // Find all the matches for the wildcard..
-      try {
-        matches = bpftrace_.probe_matcher_->get_matches_for_ap(*ap);
-      } catch (const WildcardException &e) {
-        LOG(ERROR) << e.what();
-        return;
-      }
-
-      // ... and check if they share same arguments.
-
-      Struct ap_args;
-      for (auto &match : matches) {
-        // Both uprobes and kfuncs have a target (binary for uprobes, kernel
-        // module for kfuncs).
-        std::string func = match;
-        std::string target = erase_prefix(func);
-
-        // Trying to attach to multiple kfuncs. If some of them fails on
-        // argument resolution, do not fail hard, just print a warning and
-        // continue with other functions.
-        if (probe_type == ProbeType::kfunc ||
-            probe_type == ProbeType::kretfunc) {
-          std::string err;
-          auto maybe_ap_args = bpftrace_.btf_->resolve_args(
-              func, probe_type == ProbeType::kretfunc, err);
-          if (!maybe_ap_args.has_value()) {
-            LOG(WARNING) << "kfunc:" << ap->func << ": " << err;
-            continue;
-          }
-          ap_args = std::move(*maybe_ap_args);
-        } else // uprobe
-        {
-          Dwarf *dwarf = bpftrace_.get_dwarf(target);
-          if (dwarf)
-            ap_args = dwarf->resolve_args(func);
-          else
-            LOG(WARNING, ap->loc, err_) << "No debuginfo found for " << target;
-        }
-
-        if (probe_args.size == -1)
-          probe_args = ap_args;
-        else if (ap_args != probe_args) {
-          LOG(ERROR, ap->loc, err_)
-              << "Probe has attach points with mixed arguments";
-          break;
-        }
-      }
-    } else {
-      // Resolving args for an explicit function failed, print an error and fail
-      if (probe_type == ProbeType::kfunc || probe_type == ProbeType::kretfunc) {
-        std::string err;
-        auto maybe_probe_args = bpftrace_.btf_->resolve_args(
-            ap->func, probe_type == ProbeType::kretfunc, err);
-        if (!maybe_probe_args.has_value()) {
-          LOG(ERROR, ap->loc, err_) << "kfunc:" << ap->func << ": " << err;
-          return;
-        }
-        probe_args = std::move(*maybe_probe_args);
-      } else // uprobe
-      {
-        Dwarf *dwarf = bpftrace_.get_dwarf(ap->target);
-        if (dwarf)
-          probe_args = dwarf->resolve_args(ap->func);
-        else {
-          LOG(WARNING, ap->loc, err_)
-              << "No debuginfo found for " << ap->target;
-        }
-        if ((int)probe_args.fields.size() > (arch::max_arg() + 1)) {
-          LOG(ERROR, ap->loc, err_) << "\'args\' builtin is not supported for "
-                                       "probes with stack-passed arguments.";
-        }
-      }
-    }
-
-    // check if we already stored arguments for this probe
-    auto args = bpftrace_.structs.Lookup(probe.args_typename()).lock();
-    if (args && *args != probe_args) {
-      // we did, and it's different...trigger the error
-      LOG(ERROR, ap->loc, err_)
-          << "Probe has attach points with mixed arguments";
-    } else {
-      // store/save args for each ap for later processing
-      bpftrace_.structs.Add(probe.args_typename(), std::move(probe_args));
-    }
-  }
-  return;
-}
-
 void FieldAnalyser::resolve_fields(SizedType &type)
 {
-  if (!type.IsRecordTy())
+  if (!type.IsCTypeTy())
     return;
 
   if (probe_) {
-    for (auto &ap : *probe_->attach_points)
+    for (auto &ap : probe_->attach_points)
       if (Dwarf *dwarf = bpftrace_.get_dwarf(*ap))
         dwarf->resolve_fields(type);
   }
@@ -281,19 +227,22 @@ void FieldAnalyser::resolve_fields(SizedType &type)
     bpftrace_.btf_->resolve_fields(type);
 }
 
-void FieldAnalyser::resolve_type(SizedType &type)
+void FieldAnalyser::resolve_type(const ParsedType &type)
 {
   sized_type_ = CreateNone();
 
-  const SizedType *inner_type = &type;
-  while (inner_type->IsPtrTy())
-    inner_type = inner_type->GetPointeeTy();
-  if (!inner_type->IsRecordTy())
+  const auto &base = type.base_type();
+  if (base.kind == ParsedType::Kind::Identifier &&
+      ident_to_builtin_type(base.name))
     return;
-  auto name = inner_type->GetName();
+  if (base.kind != ParsedType::Kind::Struct &&
+      base.kind != ParsedType::Kind::Union &&
+      base.kind != ParsedType::Kind::Identifier)
+    return;
+  const auto name = base.type_name();
 
   if (probe_) {
-    for (auto &ap : *probe_->attach_points)
+    for (auto &ap : probe_->attach_points)
       if (Dwarf *dwarf = bpftrace_.get_dwarf(*ap))
         sized_type_ = dwarf->get_stype(name);
   }
@@ -310,40 +259,36 @@ void FieldAnalyser::visit(Probe &probe)
 {
   probe_ = &probe;
 
-  for (AttachPoint *ap : *probe.attach_points) {
+  for (AttachPoint *ap : probe.attach_points) {
     probe_type_ = probetype(ap->provider);
     prog_type_ = progtype(probe_type_);
     attach_func_ = ap->func;
   }
-  if (probe.pred) {
-    Visit(*probe.pred);
-  }
-  for (Statement *stmt : *probe.stmts) {
-    Visit(*stmt);
-  }
+  visit(probe.block);
 }
 
 void FieldAnalyser::visit(Subprog &subprog)
 {
   probe_ = nullptr;
-
-  for (Statement *stmt : *subprog.stmts) {
-    Visit(*stmt);
-  }
+  visit(subprog.block);
 }
 
-int FieldAnalyser::analyse()
+void FieldAnalyser::visit(Cast &cast)
 {
-  Visit(*root_);
-
-  std::string errors = err_.str();
-  if (!errors.empty()) {
-    out_ << errors;
-    return 1;
-  }
-
-  return 0;
+  // N.B. Visit the expression first, so that fields can be resolved, but then
+  // visit the type so that the returned sized_type_ is always the type.
+  visit(cast.expr);
+  visit(cast.typeof);
 }
 
-} // namespace ast
-} // namespace bpftrace
+Pass CreateFieldAnalyserPass()
+{
+  auto fn = [](ASTContext &ast, BPFtrace &b) {
+    FieldAnalyser analyser(b);
+    analyser.visit(ast.root);
+  };
+
+  return Pass::create("FieldAnalyser", fn);
+};
+
+} // namespace bpftrace::ast

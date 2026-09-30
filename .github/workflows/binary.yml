@@ -9,23 +9,41 @@ on:
   push:
     branches:
       - master
+      - 'release/**'
+  pull_request:
+  workflow_dispatch:
 
 jobs:
   build-and-upload:
-    runs-on: ubuntu-latest
+    name: ${{ (github.event_name == 'pull_request' && 'build' || 'build-and-upload') }} (${{ matrix.runner }})
+    strategy:
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+
+    # For flakehub cache
+    permissions:
+      id-token: write
+      contents: read
 
     steps:
     - uses: actions/checkout@v4
-    - uses: DeterminateSystems/nix-installer-action@v4
-    - uses: DeterminateSystems/magic-nix-cache-action@v2
+      with:
+        submodules: true
+        fetch-depth: 0
+    - uses: DeterminateSystems/nix-installer-action@v17
+      with:
+        determinate: true
+    - uses: DeterminateSystems/flakehub-cache-action@v2
 
     - name: Build appimage
       run: |
-        nix build .#appimage
+        nix build .?submodules=1#appimage
         cp ./result bpftrace
 
     - name: Upload appimage
-      uses: actions/upload-artifact@v3
+      if: github.event_name != 'pull_request'
+      uses: actions/upload-artifact@v4
       with:
-        name: bpftrace
+        name: bpftrace-${{ runner.arch }}
         path: ./bpftrace

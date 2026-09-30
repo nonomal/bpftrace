@@ -1,9 +1,6 @@
-#include <algorithm>
-#include <fstream>
-
 #include <cerrno>
-
 #include <fcntl.h>
+#include <fstream>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/utsname.h>
@@ -11,8 +8,7 @@
 
 #include "lockdown.h"
 
-namespace bpftrace {
-namespace lockdown {
+namespace bpftrace::lockdown {
 
 static LockdownState from_string(const std::string &s)
 {
@@ -26,7 +22,7 @@ static LockdownState from_string(const std::string &s)
   return LockdownState::Unknown;
 }
 
-static LockdownState read_security_lockdown(void)
+static LockdownState read_security_lockdown()
 {
   std::ifstream file("/sys/kernel/security/lockdown");
   if (file.fail())
@@ -59,5 +55,4 @@ LockdownState detect()
   return read_security_lockdown();
 }
 
-} //  namespace lockdown
-} //  namespace bpftrace
+} // namespace bpftrace::lockdown

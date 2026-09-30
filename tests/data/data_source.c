@@ -1,3 +1,14 @@
+unsigned char uchar_;
+short short_;
+unsigned short ushort_;
+long long_;
+unsigned long ulong_;
+long long llong_;
+unsigned long long ullong_;
+
+typedef unsigned long size_t;
+size_t sizet_;
+
 struct Foo1 {
   int a;
   char b;
@@ -21,10 +32,32 @@ struct Foo3 {
 
 struct Foo3 foo3;
 
+struct Foo4 {
+  int pid;
+  int pgid;
+  unsigned int : 12; // padding
+  unsigned int a : 8;
+  unsigned int b : 1;
+  unsigned int c : 3;
+  unsigned int d : 20;
+};
+
+struct FooRecursive {
+  int a;
+  struct FooRecursive *next;
+};
+
+struct FooRecursive foo_recursive;
+
+enum FooEnum {
+  VALUE
+};
+
 struct Foo3 *func_1(int a,
                     struct Foo1 *foo1,
                     struct Foo2 *foo2,
-                    struct Foo3 *foo3)
+                    struct Foo3 *foo3,
+                    struct Foo4 *foo4)
 {
   return 0;
 }
@@ -53,6 +86,7 @@ struct FirstFieldsAreAnonUnion first_fields_anon_union;
 struct Arrays {
   int int_arr[4];
   char char_arr[8];
+  char char_arr2[16];
   void *ptr_arr[2];
   int multi_dim[3][2];
   int zero[0];
@@ -65,14 +99,40 @@ struct Arrays *func_arrays(struct Arrays *arr)
   return 0;
 }
 
+struct ArrayWithCompoundData {
+  struct Foo3 *data[2];
+};
+
+typedef struct {
+  int a;
+} AnonStructTypedef;
+
+AnonStructTypedef AnonTypedefArray[8];
+
+struct anon_structs {
+  AnonStructTypedef AnonTypedefArray[8];
+  struct {
+    int a;
+    int b;
+    struct {
+      int c;
+      int d;
+    } AnonSubArray[2];
+  } AnonArray[4];
+};
+
+void func_array_with_compound_data(struct ArrayWithCompoundData *arr)
+{
+}
+
+void func_anon_struct(struct anon_structs *AnonStruct,
+                      AnonStructTypedef *AnonTypedef)
+{
+}
+
 struct task_struct {
   int pid;
   int pgid;
-  int : 12; // padding
-  int a : 8;
-  int b : 1;
-  int c : 3;
-  int d : 20;
 };
 
 struct file {
@@ -113,16 +173,47 @@ int bpf_iter_task_vma()
   return 0;
 }
 
+// kfunc definitions
+struct bpf_map {};
+long bpf_map_sum_elem_count(const struct bpf_map *map)
+{
+  return 0;
+}
+
+long __probestub_event_rt(void *__data, long first_real_arg)
+{
+  return first_real_arg;
+}
+
+struct sock {
+  int cookie;
+};
+
+void tcp_shutdown(struct sock *sk, int how)
+{
+}
+
+// kernel percpu variables
+__attribute__((section(".data..percpu"))) unsigned long process_counts;
+
+// Make sure all new mocked kernel functions are called in this main (below)
+// so they don't get optimzed away
 int main(void)
 {
   struct bpf_iter__task iter_task;
   struct bpf_iter__task_file iter_task_file;
   struct bpf_iter__task_vma iter_task_vma;
+  struct bpf_map bpf_map;
+  struct sock sk;
+  enum FooEnum e;
 
-  func_1(0, 0, 0, 0);
+  func_1(0, 0, 0, 0, 0);
 
   bpf_iter_task();
   bpf_iter_task_file();
   bpf_iter_task_vma();
+  bpf_map_sum_elem_count(&bpf_map);
+  __probestub_event_rt((void *)&bpf_map, 1);
+  tcp_shutdown(&sk, 0);
   return 0;
 }

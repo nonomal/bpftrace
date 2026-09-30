@@ -1,26 +1,27 @@
 #pragma once
 
+#include <cereal/access.hpp>
 #include <map>
 #include <memory>
 #include <optional>
 
-#include <cereal/access.hpp>
-
 #include "ast/ast.h"
 #include "types.h"
-#include "utils.h"
+#include "util/hash.h"
+#include "util/opaque.h"
 
 namespace bpftrace {
 
+static constexpr auto RETVAL_FIELD_NAME = "$retval";
+
 struct Bitfield {
-  Bitfield(size_t byte_offset, size_t bit_width);
+  Bitfield(size_t bit_offset, size_t bit_width);
   Bitfield(size_t read_bytes, size_t access_rshift, uint64_t mask)
       : read_bytes(read_bytes), access_rshift(access_rshift), mask(mask)
   {
   }
   Bitfield() // necessary for serialization
-  {
-  }
+      = default;
 
   bool operator==(const Bitfield &other) const;
   bool operator!=(const Bitfield &other) const;
@@ -31,6 +32,22 @@ struct Bitfield {
   size_t access_rshift;
   // Then logical AND `mask` to mask out everything but this bitfield
   uint64_t mask;
+
+  template <typename T>
+  bpftrace::util::OpaqueValue to_opaque(
+      const bpftrace::util::OpaqueValue &data) const
+  {
+    size_t rshiftbits;
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    rshiftbits = access_rshift;
+#else
+    rshiftbits = (data.size() - read_bytes) * 8;
+    rshiftbits += access_rshift;
+#endif
+
+    return bpftrace::util::OpaqueValue::from<T>(
+        (data.bitcast<T>() >> rshiftbits) & static_cast<T>(mask));
+  }
 
 private:
   friend class cereal::access;
@@ -80,8 +97,14 @@ struct Struct {
   Fields fields;
 
   bool allow_override = true;
+  bool is_tracepoint_args = false;
 
-  Struct() = default;
+  Struct() = default; // Used for serialization.
+  Struct(const Struct &other) = delete;
+  Struct &operator=(const Struct &other) = delete;
+  Struct(Struct &&other) = default;
+  Struct &operator=(Struct &&other) = default;
+
   explicit Struct(int size, bool allow_override = true)
       : size(size), allow_override(allow_override)
   {
@@ -89,15 +112,19 @@ struct Struct {
 
   bool HasField(const std::string &name) const;
   const Field &GetField(const std::string &name) const;
+  size_t GetFieldIdx(const std::string &name) const;
   void AddField(const std::string &field_name,
                 const SizedType &type,
-                ssize_t offset,
-                const std::optional<Bitfield> &bitfield,
-                bool is_data_loc);
+                ssize_t offset = 0,
+                const std::optional<Bitfield> &bitfield = std::nullopt);
   bool HasFields() const;
   void ClearFields();
 
-  static std::unique_ptr<Struct> CreateTuple(std::vector<SizedType> fields);
+  static std::shared_ptr<Struct> CreateRecord(
+      const std::vector<SizedType> &fields,
+      const std::vector<std::string_view> &field_names);
+  static std::shared_ptr<Struct> CreateTuple(
+      const std::vector<SizedType> &fields);
   void Dump(std::ostream &os);
 
   bool operator==(const Struct &rhs) const
@@ -121,54 +148,18 @@ private:
 
 std::ostream &operator<<(std::ostream &os, const Fields &t);
 
-} // namespace bpftrace
-
-namespace std {
-template <>
-struct hash<bpftrace::Struct> {
-  size_t operator()(const bpftrace::Struct &s) const
-  {
-    size_t hash = std::hash<int>()(s.size);
-    for (auto &field : s.fields)
-      bpftrace::hash_combine(hash, field.type);
-    return hash;
-  }
-};
-
-template <>
-struct hash<shared_ptr<bpftrace::Struct>> {
-  size_t operator()(const std::shared_ptr<bpftrace::Struct> &s_ptr) const
-  {
-    return std::hash<bpftrace::Struct>()(*s_ptr);
-  }
-};
-
-template <>
-struct equal_to<shared_ptr<bpftrace::Struct>> {
-  bool operator()(const std::shared_ptr<bpftrace::Struct> &lhs,
-                  const std::shared_ptr<bpftrace::Struct> &rhs) const
-  {
-    return *lhs == *rhs;
-  }
-};
-} // namespace std
-
-namespace bpftrace {
-
 class StructManager {
 public:
   // struct map manipulation
-  void Add(const std::string &name, size_t size, bool allow_override = true);
-  void Add(const std::string &name, Struct &&record);
+  std::weak_ptr<Struct> Add(const std::string &name,
+                            size_t size,
+                            bool allow_override = true);
+  void Add(const std::string &name, std::shared_ptr<Struct> &&record);
   std::weak_ptr<Struct> Lookup(const std::string &name) const;
   std::weak_ptr<Struct> LookupOrAdd(const std::string &name,
                                     size_t size,
                                     bool allow_override = true);
   bool Has(const std::string &name) const;
-
-  // tuples set manipulation
-  std::weak_ptr<Struct> AddTuple(std::vector<SizedType> fields);
-  size_t GetTuplesCnt() const;
 
   // probe args lookup
   const Field *GetProbeArg(const ast::Probe &probe,
@@ -176,7 +167,6 @@ public:
 
 private:
   std::map<std::string, std::shared_ptr<Struct>> struct_map_;
-  std::unordered_set<std::shared_ptr<Struct>> tuples_;
 };
 
 } // namespace bpftrace

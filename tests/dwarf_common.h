@@ -1,35 +1,35 @@
 #pragma once
 
-#include <sys/stat.h>
-
 #include <cstdio>
 #include <fcntl.h>
+#include <fstream>
 #include <stdexcept>
+#include <sys/stat.h>
 
-#include "data/dwarf_data.h"
+#include "util/temp.h"
+
+namespace {
+#include "data/data_source_dwarf.h"
+} // namespace
 
 class test_dwarf : public ::testing::Test {
 protected:
-  static void SetUpTestSuite()
+  void SetUp() override
   {
-    std::ofstream file(bin_, std::ios::trunc | std::ios::binary);
-    file.write(reinterpret_cast<const char *>(dwarf_data), dwarf_data_len);
-    file.close();
+    auto r = bpftrace::util::TempFile::create();
+    ASSERT_TRUE(bool(r));
+    std::span<const char> bytes(reinterpret_cast<const char *>(dwarf_data),
+                                sizeof(dwarf_data));
+    ASSERT_TRUE(bool(r->write_all(bytes)));
+    file.emplace(std::move(*r));
+    path = file->path().string();
+    bin_ = path.c_str();
 
-    if (!file)
-      throw std::runtime_error("Failed to create dwarf data file");
-
-    // Give executable permissions to everyone
-    int err = chmod(bin_, 0755);
-    if (err)
-      throw std::runtime_error("Failed to chmod dwarf data file: " +
-                               std::to_string(err));
+    // Ensure that it is executable.
+    ASSERT_EQ(::chmod(bin_, 0755), 0);
   }
 
-  static void TearDownTestSuite()
-  {
-    std::remove(bin_);
-  }
-
-  static constexpr const char *bin_ = "/tmp/bpftrace-test-dwarf-data";
+  std::optional<bpftrace::util::TempFile> file;
+  std::string path;
+  const char *bin_; // Reference to path.c_str().
 };

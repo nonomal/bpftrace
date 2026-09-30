@@ -1,21 +1,24 @@
-
+#include "ast/passes/ap_probe_expansion.h"
+#include "ast/passes/attachpoint_passes.h"
+#include "ast/passes/clang_build.h"
 #include "ast/passes/codegen_llvm.h"
+#include "ast/passes/control_flow_analyser.h"
 #include "ast/passes/field_analyser.h"
+#include "ast/passes/macro_expansion.h"
+#include "ast/passes/map_sugar.h"
+#include "ast/passes/named_param.h"
+#include "ast/passes/resolve_imports.h"
 #include "ast/passes/resource_analyser.h"
-#include "ast/passes/semantic_analyser.h"
-
+#include "ast/passes/types/type_resolver.h"
+#include "ast/passes/types/type_system.h"
 #include "bpftrace.h"
-#include "clang_parser.h"
-#include "driver.h"
+#include "btf.h"
+#include "btf_common.h"
 #include "mocks.h"
-#include "gmock/gmock.h"
+#include "parser.h"
 #include "gtest/gtest.h"
 
-namespace bpftrace {
-namespace test {
-namespace probe {
-
-#include "btf_common.h"
+namespace bpftrace::test::probe {
 
 using bpftrace::ast::AttachPoint;
 using bpftrace::ast::AttachPointList;
@@ -24,29 +27,39 @@ using bpftrace::ast::Probe;
 void gen_bytecode(const std::string &input, std::stringstream &out)
 {
   auto bpftrace = get_mock_bpftrace();
-  Driver driver(*bpftrace);
+  ast::ASTContext ast("stdin", input);
 
-  ASSERT_EQ(driver.parse_str(input), 0);
+  ast::CDefinitions no_c_defs; // Output from clang parser.
+  // Because some stdlib's bpf.c file is conflicting with the custom BTF we
+  // generate for the test, just disable stdlib for this test right now.
+  ast::Imports no_imports;
 
-  ast::FieldAnalyser fields(driver.root.get(), *bpftrace);
-  EXPECT_EQ(fields.analyse(), 0);
-
-  ClangParser clang;
-  clang.parse(driver.root.get(), *bpftrace);
-
-  // Override to mockbpffeature.
-  bpftrace->feature_ = std::make_unique<MockBPFfeature>(true);
-  ast::SemanticAnalyser semantics(driver.root.get(), *bpftrace);
-  ASSERT_EQ(semantics.analyse(), 0);
-
-  ast::ResourceAnalyser resource_analyser(driver.root.get());
-  auto resources_optional = resource_analyser.analyse();
-  ASSERT_TRUE(resources_optional.has_value());
-  bpftrace->resources = resources_optional.value();
-
-  ast::CodegenLLVM codegen(driver.root.get(), *bpftrace);
-  codegen.generate_ir();
-  codegen.DumpIR(out);
+  // N.B. No macro expansion.
+  auto ok = ast::PassManager()
+                .put(ast)
+                .put<BPFtrace>(*bpftrace)
+                .put(get_mock_function_info())
+                .put(no_c_defs)
+                .put(no_imports)
+                .add(CreateParsePass())
+                .add(ast::CreateParseAttachpointsPass())
+                .add(ast::CreateControlFlowPass())
+                .add(ast::CreateProbeAndApExpansionPass())
+                .add(ast::CreateMacroExpansionPass())
+                .add(CreateParseBTFPass())
+                .add(ast::CreateMapSugarPass())
+                .add(ast::CreateFieldAnalyserPass())
+                .add(ast::CreateNamedParamsPass())
+                .add(ast::CreateLLVMInitPass())
+                .add(ast::CreateClangBuildPass())
+                .add(ast::CreateTypeSystemPass())
+                .add(ast::CreateTypeResolverPass())
+                .add(ast::CreateResourcePass())
+                .add(ast::AllCompilePasses())
+                .run();
+  ASSERT_TRUE(ok && ast.diagnostics().ok());
+  auto &obj = ok->get<ast::BpfObject>();
+  out.write(obj.data.data(), obj.data.size());
 }
 
 void compare_bytecode(const std::string &input1, const std::string &input2)
@@ -62,10 +75,11 @@ void compare_bytecode(const std::string &input1, const std::string &input2)
 
 TEST(probe, short_name)
 {
-  compare_bytecode("tracepoint:a:b { args }", "t:a:b { args }");
+  compare_bytecode("tracepoint:sched:sched_one { args }",
+                   "t:sched:sched_one { args }");
   compare_bytecode("kprobe:f { pid }", "k:f { pid }");
   compare_bytecode("kretprobe:f { pid }", "kr:f { pid }");
-  compare_bytecode("uprobe:sh:f { 1 }", "u:sh:f { 1 }");
+  compare_bytecode("uprobe:/bin/sh:f { 1 }", "u:/bin/sh:f { 1 }");
   compare_bytecode("profile:hz:997 { 1 }", "p:hz:997 { 1 }");
   compare_bytecode("hardware:cache-references:1000000 { 1 }",
                    "h:cache-references:1000000 { 1 }");
@@ -73,17 +87,23 @@ TEST(probe, short_name)
   compare_bytecode("interval:s:1 { 1 }", "i:s:1 { 1 }");
 }
 
+TEST(probe, case_insensitive)
+{
+  compare_bytecode("tracepoint:sched:sched_one { args }",
+                   "traCepoInt:sched:sched_one { args }");
+  compare_bytecode("kprobe:f { pid }", "KPROBE:f { pid }");
+  compare_bytecode("BEGIN { pid }", "begin { pid }");
+}
+
 class probe_btf : public test_btf {};
 
 TEST_F(probe_btf, short_name)
 {
-  compare_bytecode("kfunc:func_1 { 1 }", "f:func_1 { 1 }");
-  compare_bytecode("kretfunc:func_1 { 1 }", "fr:func_1 { 1 }");
+  compare_bytecode("fentry:func_1 { 1 }", "f:func_1 { 1 }");
+  compare_bytecode("fexit:func_1 { 1 }", "fr:func_1 { 1 }");
   compare_bytecode("iter:task { 1 }", "it:task { 1 }");
   compare_bytecode("iter:task_file { 1 }", "it:task_file { 1 }");
   compare_bytecode("iter:task_vma { 1 }", "it:task_vma { 1 }");
 }
 
-} // namespace probe
-} // namespace test
-} // namespace bpftrace
+} // namespace bpftrace::test::probe

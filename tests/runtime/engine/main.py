@@ -12,21 +12,37 @@ from runner import Runner, ok, fail, warn
 
 TEST_FILTER = os.getenv("TEST_FILTER")
 
-def main(test_filter, run_aot_tests):
+def main(test_filter, allowlist_file, run_aot_tests):
     if not test_filter:
         test_filter = ".*"
+
+    allowlist = set()
+    if allowlist_file:
+        with open(allowlist_file, 'r') as f:
+            allowlist = { line.strip() for line in f if not line.startswith("#") }
 
     try:
         test_suite = sorted(TestParser.read_all(run_aot_tests))
         test_suite = [ (n, sorted(t)) for n, t in test_suite ]
     except (UnknownFieldError, RequiredFieldError) as error:
-        print(fail(str(error)))
+        print(fail(f"[  FAILED  ] {str(error)}"))
         exit(1)
 
-    # Apply filter
+    # Apply filters
+    positive_patterns = "|".join([p for p in test_filter.split(':')
+                                  if not p.startswith('-')])
+    negative_patterns = "|".join([p[1:] for p in test_filter.split(':')
+                                  if p.startswith('-')])
+    if len(positive_patterns) == 0:
+        positive_patterns = ".*"
+
     filtered_suites = []
     for fname, tests in test_suite:
-        filtered_tests = [t for t in tests if re.search(test_filter, "{}.{}".format(fname, t.name))]
+        filtered_tests = [t for t in tests if
+                          re.search(positive_patterns, "{}.{}".format(fname, t.name))]
+        if negative_patterns:
+            filtered_tests = [t for t in filtered_tests if
+                              not re.search(negative_patterns, "{}.{}".format(fname, t.name))]
         if len(filtered_tests) != 0:
             filtered_suites.append((fname, filtered_tests))
     test_suite = filtered_suites
@@ -46,6 +62,9 @@ def main(test_filter, run_aot_tests):
     for fname, tests in test_suite:
         print(ok("[----------]") + " %d tests from %s" % (len(tests), fname))
         for test in tests:
+            if allowlist_file and (f"{fname}.{test.name}" not in allowlist):
+                skipped_tests.append((fname, test, Runner.SKIP_NOT_IN_ALLOWLIST))
+                continue
             status = Runner.run_test(test)
             if Runner.skipped(status):
                 skipped_tests.append((fname, test, status))
@@ -73,7 +92,7 @@ def main(test_filter, run_aot_tests):
         for timeouted_test in timeouted_tests:
             print(fail("[  TIMEOUT ]") + " %s" % timeouted_test)
 
-    if failed_tests:
+    if failed_tests or timeouted_tests:
         exit(1)
 
 
@@ -81,9 +100,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Runtime tests for bpftrace.')
     parser.add_argument('--filter', type=str, dest='test_filter',
                         help='Run only specified runtime test. Format should be "<test feature/test group>.<testcase name>"')
+    parser.add_argument('--allowlist_file', type=str,
+                        help='Path to file containing tests to allow. Format is one test per line.')
     parser.add_argument('--run-aot-tests', action='store_true',
                         help='Run ahead-of-time compilation tests. Note this would roughly double test time.')
 
     args = parser.parse_args()
 
-    main(args.test_filter or TEST_FILTER, args.run_aot_tests)
+    main(args.test_filter or TEST_FILTER, args.allowlist_file, args.run_aot_tests)

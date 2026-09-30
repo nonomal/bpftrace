@@ -1,11 +1,8 @@
-#ifdef HAVE_SYSTEMTAP_SYS_SDT_H
-#include <sys/sdt.h>
-#else
-#define DTRACE_PROBE2(a, b, c, d) (void)0
-#endif
 #include <stdio.h>
 #include <sys/time.h>
 #include <unistd.h>
+
+#include "libbpf-usdt/usdt.h"
 
 __attribute__((always_inline)) inline static void myclock(int probe_num)
 {
@@ -15,12 +12,16 @@ __attribute__((always_inline)) inline static void myclock(int probe_num)
   (void)on_stack;
   struct timeval tv;
   gettimeofday(&tv, NULL);
-  DTRACE_PROBE2(tracetest, testprobe, tv.tv_sec, on_stack);
+  USDT(tracetest, testprobe, tv.tv_sec, on_stack);
+}
+
+__attribute__((always_inline)) inline static void mywrapper_inlined() {
+  myclock(100);
 }
 
 static void mywrapper()
 {
-  myclock(100);
+  mywrapper_inlined();
 }
 
 static void loop()

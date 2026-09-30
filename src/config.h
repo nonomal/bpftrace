@@ -1,206 +1,129 @@
 #pragma once
 
 #include <cstdint>
-#include <iostream>
-#include <map>
-#include <optional>
-#include <set>
-#include <variant>
+#include <utility>
 
 #include "types.h"
+#include "util/result.h"
 
 namespace bpftrace {
 
-// This is used to determine which source
-// takes precedence when a config key is set
-enum class ConfigSource {
-  // the default config value
-  default_,
-  // config set via environment variable
-  env_var,
-  // config set via config script syntax
-  script,
+enum class ConfigMissingProbes {
+  ignore,
+  warn,
+  error,
 };
 
-enum class ConfigKeyBool {
-  cpp_demangle,
-  lazy_symbolication,
-  probe_inline,
+enum class ConfigUnstable {
+  enable,
+  warn,
+  error,
 };
 
-enum class ConfigKeyInt {
-  log_size,
-  max_bpf_progs,
-  max_cat_bytes,
-  max_map_keys,
-  max_probes,
-  max_strlen,
-  max_type_res_iterations,
-  perf_rb_pages,
+// Taken from here:
+// https://elixir.bootlin.com/linux/v5.16/source/include/linux/license.h
+enum CompatibleBPFLicense {
+  GPL,
+  GPL_V2,
+  GPL_AR,
+  DUAL_BSD_GPL,
+  DUAL_MIT_GPL,
+  DUAL_MPL_GPL
 };
 
-enum class ConfigKeyString {
-  str_trunc_trailer,
-};
+static const auto UNSTABLE_IMPORT_STATEMENT = "unstable_import_statement";
+static const auto UNSTABLE_TSERIES = "unstable_tseries";
+static const auto UNSTABLE_TYPEINFO = "unstable_typeinfo";
+static const auto UNSTABLE_DW_USTACK = "unstable_dw_ustack";
 
-enum class ConfigKeyStackMode {
-  default_,
-};
-
-enum class ConfigKeyUserSymbolCacheType {
-  default_,
-};
-
-typedef std::variant<ConfigKeyBool,
-                     ConfigKeyInt,
-                     ConfigKeyString,
-                     ConfigKeyStackMode,
-                     ConfigKeyUserSymbolCacheType>
-    ConfigKey;
-
-// The strings in CONFIG_KEY_MAP AND ENV_ONLY match the env variables (minus the
-// 'BPFTRACE_' prefix)
-const std::map<std::string, ConfigKey> CONFIG_KEY_MAP = {
-  { "cache_user_symbols", ConfigKeyUserSymbolCacheType::default_ },
-  { "cpp_demangle", ConfigKeyBool::cpp_demangle },
-  { "lazy_symbolication", ConfigKeyBool::lazy_symbolication },
-  { "log_size", ConfigKeyInt::log_size },
-  { "max_bpf_progs", ConfigKeyInt::max_bpf_progs },
-  { "max_cat_bytes", ConfigKeyInt::max_cat_bytes },
-  { "max_map_keys", ConfigKeyInt::max_map_keys },
-  { "max_probes", ConfigKeyInt::max_probes },
-  { "max_strlen", ConfigKeyInt::max_strlen },
-  { "max_type_res_iterations", ConfigKeyInt::max_type_res_iterations },
-  { "perf_rb_pages", ConfigKeyInt::perf_rb_pages },
-  { "probe_inline", ConfigKeyBool::probe_inline },
-  { "stack_mode", ConfigKeyStackMode::default_ },
-  { "str_trunc_trailer", ConfigKeyString::str_trunc_trailer },
-};
-
-// These are not tracked by the config class
-const std::set<std::string> ENV_ONLY = {
-  "btf",           "debug_output",   "kernel_build", "kernel_source",
-  "max_ast_nodes", "verify_llvm_ir", "vmlinux",
-};
-
-struct ConfigValue {
-  ConfigSource source = ConfigSource::default_;
-  std::variant<bool, uint64_t, std::string, StackMode, UserSymbolCacheType>
-      value;
+static std::unordered_set<std::string> DEPRECATED_CONFIGS = {
+  "symbol_source",   "max_type_res_iterations", "unstable_addr",
+  "unstable_import", "unstable_macro",          "unstable_map_decl"
 };
 
 class Config {
 public:
-  explicit Config(bool has_cmd = false, bool bt_verbose = false);
+  Config(bool has_cmd = false);
 
-  bool get(ConfigKeyBool key) const
-  {
-    return get<bool>(key);
-  }
+  // Fields can be accessed directly via the callers, although care should be
+  // taken not to mutate these fields unless the caller truly intends to change
+  // them. The `set` method is provided for external users to set the values.
+  Result<OK> set(const std::string &key, uint64_t val);
+  Result<OK> set(const std::string &key, const std::string &val);
 
-  uint64_t get(ConfigKeyInt key) const
-  {
-    return get<uint64_t>(key);
-  }
+  // Helpers for analysis of variables.
+  bool is_unstable(const std::string &key);
+  Result<OK> load_environment();
 
-  std::string get(ConfigKeyString key) const
-  {
-    return get<std::string>(key);
-  }
+  static std::string get_license_str(CompatibleBPFLicense license);
 
-  StackMode get(ConfigKeyStackMode key) const
-  {
-    return get<StackMode>(key);
-  }
+  // All configuration options.
+  bool cpp_demangle = true;
+  bool lazy_symbolication = true;
+  bool print_maps_on_exit = true;
+  ConfigUnstable unstable_import_statement = ConfigUnstable::error;
+  ConfigUnstable unstable_tseries = ConfigUnstable::warn;
+  ConfigUnstable unstable_typeinfo = ConfigUnstable::error;
+  ConfigUnstable unstable_dw_ustack = ConfigUnstable::warn;
+#ifdef HAVE_BLAZESYM
+  bool use_blazesym = true;
+  bool show_debug_info = true;
+#else
+  bool use_blazesym = false;
+  bool show_debug_info = false;
+#endif
+  uint64_t log_size = 1000000;
+  uint64_t max_bpf_progs = 1024;
+  uint64_t max_cat_bytes = 10240;
+  uint64_t max_map_keys = 4096;
+  uint64_t max_probes = 1024;
+  uint64_t max_strlen = 1024;
+  uint64_t on_stack_limit = 32;
+  uint64_t perf_rb_pages = 0; // See get_buffer_pages
+  CompatibleBPFLicense license = CompatibleBPFLicense::GPL;
+  std::string str_trunc_trailer = "..";
+  ConfigMissingProbes missing_probes = ConfigMissingProbes::error;
+  StackMode stack_mode = StackMode::bpftrace;
 
-  UserSymbolCacheType get(ConfigKeyUserSymbolCacheType key) const
-  {
-    return get<UserSymbolCacheType>(key);
-  }
+  // Initialized in the constructor.
+  UserSymbolCacheType user_symbol_cache_type;
 
-  static std::optional<StackMode> get_stack_mode(const std::string &s);
-  std::optional<ConfigKey> get_config_key(const std::string &str,
-                                          std::string &err);
-
-  friend class ConfigSetter;
-
-private:
-  template <typename T>
-  bool set(ConfigKey key, T val, ConfigSource source)
-  {
-    auto it = config_map_.find(key);
-    if (it == config_map_.end()) {
-      throw std::runtime_error("No default set for config key");
-    }
-    if (!can_set(it->second.source, source)) {
-      return false;
-    }
-
-    it->second.value = val;
-    it->second.source = source;
-    return true;
-  }
-
-  template <typename T>
-  T get(ConfigKey key) const
-  {
-    auto it = config_map_.find(key);
-    if (it == config_map_.end()) {
-      throw std::runtime_error("Config key does not exist in map");
-    }
-    try {
-      return std::get<T>(it->second.value);
-    } catch (std::bad_variant_access const &ex) {
-      // This shouldn't happen
-      throw std::runtime_error("Type mismatch for config key");
-    }
-  }
-
-private:
-  bool can_set(ConfigSource prevSource, ConfigSource);
-  bool is_aslr_enabled();
-  bool bt_verbose_ = false;
-
-  std::map<ConfigKey, ConfigValue> config_map_;
+  uint64_t pad_max_strlen() const;
 };
 
-class ConfigSetter {
+// Specific key has been renamed, must be handled by caller. This may be
+// returned by the `Config::set` method if a different key must be used to set
+// the value. This is explicitly propagated in order to ensure that the caller
+// can appropriately propagate this information to the user.
+class RenameError : public ErrorInfo<RenameError> {
 public:
-  explicit ConfigSetter(Config &config, ConfigSource source)
-      : config_(config), source_(source){};
+  static char ID;
+  RenameError(std::string &&name) : name_(std::move(name)) {};
+  void log(llvm::raw_ostream &OS) const override;
 
-  bool set(ConfigKeyBool key, bool val)
+  // Returns the new key which must be used.
+  const std::string &new_name() const
   {
-    return config_.set(key, val, source_);
+    return name_;
   }
-
-  bool set(ConfigKeyInt key, uint64_t val)
-  {
-    return config_.set(key, val, source_);
-  }
-
-  bool set(ConfigKeyString key, const std::string &val)
-  {
-    return config_.set(key, val, source_);
-  }
-
-  bool set(StackMode val)
-  {
-    return config_.set(ConfigKeyStackMode::default_, val, source_);
-  }
-
-  bool set(UserSymbolCacheType val)
-  {
-    return config_.set(ConfigKeyUserSymbolCacheType::default_, val, source_);
-  }
-
-  bool set_stack_mode(const std::string &s);
-  bool set_user_symbol_cache_type(const std::string &s);
-
-  Config &config_;
 
 private:
-  const ConfigSource source_;
+  std::string name_;
+};
+
+class LicenseError : public ErrorInfo<LicenseError> {
+public:
+  static char ID;
+  LicenseError(std::string license) : license_(std::move(license)) {};
+  void log(llvm::raw_ostream &OS) const override;
+
+  const std::string &license() const
+  {
+    return license_;
+  }
+
+private:
+  std::string license_;
 };
 
 } // namespace bpftrace

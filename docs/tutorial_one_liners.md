@@ -1,6 +1,6 @@
 # The bpftrace One-Liner Tutorial
 
-This teaches you bpftrace for Linux in 12 easy lessons, where each lesson is a one-liner you can try running. This series of one-liners introduces concepts which are summarized as bullet points. For a full reference to bpftrace, see the [Man page](../man/adoc/bpftrace.adoc)
+This teaches you bpftrace for Linux in 12 easy lessons, where each lesson is a one-liner you can try running. This series of one-liners introduces concepts which are summarized as bullet points. Read more about [the language](language.md), [the standard library](stdlib.md), and [CLI options](../man/adoc/bpftrace.adoc).
 
 Contributed by Brendan Gregg, Netflix (2018), based on his FreeBSD [DTrace Tutorial](https://wiki.freebsd.org/DTrace/Tutorial).
 
@@ -23,8 +23,11 @@ bpftrace -l 'tracepoint:syscalls:sys_enter_*'
 # Lesson 2. Hello World
 
 ```
-# bpftrace -e 'BEGIN { printf("hello world\n"); }'
-Attaching 1 probe...
+bpftrace -e 'BEGIN { printf("hello world\n"); }'
+```
+Expected Output:
+```
+Attached 1 probe
 hello world
 ^C
 ```
@@ -37,8 +40,11 @@ This prints a welcome message. Run it, then hit Ctrl-C to end.
 # Lesson 3. File Opens
 
 ```
-# bpftrace -e 'tracepoint:syscalls:sys_enter_openat { printf("%s %s\n", comm, str(args.filename)); }'
-Attaching 1 probe...
+bpftrace -e 'tracepoint:syscalls:sys_enter_openat { printf("%s %s\n", comm, str(args.filename)); }'
+```
+Expected Output:
+```
+Attached 1 probe
 snmp-pass /proc/cpuinfo
 snmp-pass /proc/stat
 snmpd /proc/net/dev
@@ -61,7 +67,10 @@ members of this struct can be found with: `bpftrace -vl tracepoint:syscalls:sys_
 
 ```
 bpftrace -e 'tracepoint:raw_syscalls:sys_enter { @[comm] = count(); }'
-Attaching 1 probe...
+```
+Expected Output:
+```
+Attached 1 probe
 ^C
 
 @[bpftrace]: 6
@@ -81,8 +90,11 @@ Maps are automatically printed when bpftrace ends (eg, via Ctrl-C).
 # Lesson 5. Distribution of read() Bytes
 
 ```
-# bpftrace -e 'tracepoint:syscalls:sys_exit_read /pid == 18644/ { @bytes = hist(args.ret); }'
-Attaching 1 probe...
+bpftrace -e 'tracepoint:syscalls:sys_exit_read /pid == 18644/ { @bytes = hist(args.ret); }'
+```
+Expected Output:
+```
+Attached 1 probe
 ^C
 
 @bytes:
@@ -107,8 +119,11 @@ This summarizes the return value of the sys_read() kernel function for PID 18644
 # Lesson 6. Kernel Dynamic Tracing of read() Bytes
 
 ```
-# bpftrace -e 'kretprobe:vfs_read { @bytes = lhist(retval, 0, 2000, 200); }'
-Attaching 1 probe...
+bpftrace -e 'kretprobe:vfs_read { @bytes = lhist(retval, 0, 2000, 200); }'
+```
+Expected Output:
+```
+Attached 1 probe
 ^C
 
 @bytes:
@@ -134,8 +149,11 @@ Summarize read() bytes as a linear histogram, and traced using kernel dynamic tr
 # Lesson 7. Timing read()s
 
 ```
-# bpftrace -e 'kprobe:vfs_read { @start[tid] = nsecs; } kretprobe:vfs_read /@start[tid]/ { @ns[comm] = hist(nsecs - @start[tid]); delete(@start[tid]); }'
-Attaching 2 probes...
+bpftrace -e 'kprobe:vfs_read { @start[tid] = nsecs; } kretprobe:vfs_read /@start[tid]/ { @ns[comm] = hist(nsecs - @start[tid]); delete(@start, tid); }'
+```
+Expected Output:
+```
+Attached 2 probes
 
 [...]
 @ns[snmp-pass]:
@@ -168,13 +186,16 @@ Summarize the time spent in read(), in nanoseconds, as a histogram, by process n
 - nsecs: Nanoseconds since boot. This is a high resolution timestamp counter than can be used to time events.
 - /@start[tid]/: This filter checks that the start time was seen and recorded. Without this filter, this program may be launched during a read and only catch the end, resulting in a time calculation of now - zero, instead of now - start.
 
-- delete(@start[tid]): this frees the variable.
+- delete(@start, tid): this frees the variable.
 
 # Lesson 8. Count Process-Level Events
 
 ```
-# bpftrace -e 'tracepoint:sched:sched* { @[probe] = count(); } interval:s:5 { exit(); }'
-Attaching 25 probes...
+bpftrace -e 'tracepoint:sched:sched* { @[probe] = count(); } interval:s:5 { exit(); }'
+```
+Expected Output:
+```
+Attached 25 probes
 @[tracepoint:sched:sched_wakeup_new]: 1
 @[tracepoint:sched:sched_process_fork]: 1
 @[tracepoint:sched:sched_process_exec]: 1
@@ -198,8 +219,11 @@ Count process-level events for five seconds, printing a summary.
 # Lesson 9. Profile On-CPU Kernel Stacks
 
 ```
-# bpftrace -e 'profile:hz:99 { @[kstack] = count(); }'
-Attaching 1 probe...
+bpftrace -e 'profile:hz:99 { @[kstack] = count(); }'
+```
+Expected Output:
+```
+Attached 1 probe
 ^C
 
 [...]
@@ -228,7 +252,10 @@ Profile kernel stacks at 99 Hertz, printing a frequency count.
 # Lesson 10. Scheduler Tracing
 
 ```
-# bpftrace -e 'tracepoint:sched:sched_switch { @[kstack] = count(); }'
+bpftrace -e 'tracepoint:sched:sched_switch { @[kstack] = count(); }'
+```
+Expected Output:
+```
 ^C
 [...]
 
@@ -262,8 +289,11 @@ This counts stack traces that led to context switching (off-CPU) events. The abo
 # Lesson 11. Block I/O Tracing
 
 ```
-# bpftrace -e 'tracepoint:block:block_rq_issue { @ = hist(args.bytes); }'
-Attaching 1 probe...
+bpftrace -e 'tracepoint:block:block_rq_issue { @ = hist(args.bytes); }'
+```
+Expected Output:
+```
+Attached 1 probe
 ^C
 
 @:
@@ -307,11 +337,11 @@ The context of this probe is important: this fires when the I/O is issued to the
 
 kprobe:vfs_open
 {
-	printf("open path: %s\n", str(((struct path *)arg0)->dentry->d_name.name));
+  printf("open path: %s\n", str(((struct path *)arg0)->dentry->d_name.name));
 }
 
 # bpftrace path.bt
-Attaching 1 probe...
+Attached 1 probe
 open path: dev
 open path: if_inet6
 open path: retrans_time_ms
